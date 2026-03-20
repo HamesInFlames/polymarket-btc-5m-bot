@@ -33,7 +33,7 @@ def _run_bot():
     try:
         from bot import print_banner, main_loop
         print_banner()
-        main_loop(max_trades=0)
+        main_loop()
     except Exception as e:
         log.critical("Bot thread crashed: %s", e, exc_info=True)
         dashboard.set_error(f"Bot crashed: {e}")
