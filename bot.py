@@ -17,6 +17,7 @@ of loss.  Over 90% of back-tested strategies fail in live markets.
 Always consult a qualified financial advisor before risking real capital.
 """
 
+import argparse
 import logging
 import signal
 import sys
@@ -37,6 +38,7 @@ from src.price_oracle import get_btc_price
 from src.strategy import evaluate_round
 from src.risk_manager import RiskManager
 from src.trader import place_buy_order
+from src.bot_state import state as dashboard, TradeEntry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,8 +61,10 @@ def _handle_signal(signum, frame):
     _shutdown = True
 
 
-signal.signal(signal.SIGINT, _handle_signal)
-signal.signal(signal.SIGTERM, _handle_signal)
+import threading as _threading
+if _threading.current_thread() is _threading.main_thread():
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
 
 
 def print_banner():
@@ -114,27 +118,51 @@ class RoundTracker:
             self._traded.discard(k)
 
 
-def main_loop():
+def main_loop(max_trades: int = 0):
     tracker = RoundTracker()
     cycle = 0
+    trade_count = 0
+
+    mode = "LIVE" if LIVE_TRADING else "DRY RUN"
+    dashboard.update_bot_status(True, 0, 0, max_trades, mode)
 
     while not _shutdown:
+        if max_trades > 0 and trade_count >= max_trades:
+            log.info("Reached max trades limit (%d) - stopping.", max_trades)
+            break
+
         cycle += 1
+        dashboard.update_bot_status(True, cycle, trade_count, max_trades, mode)
 
         allowed, reason = risk.pre_trade_check()
+        dashboard.update_risk_stats(risk.stats_summary())
         if not allowed:
             log.warning("Risk check blocked: %s - sleeping 60s", reason)
+            dashboard.add_log("WARN", f"Risk blocked: {reason}")
             _sleep(60)
             continue
 
-        log.info("-- Cycle %d ------------------------------------------", cycle)
+        log.info("-- Cycle %d  [trades: %d/%s] -------------------------",
+                 cycle, trade_count, max_trades or "∞")
 
-        rounds = discover_active_btc_5m_markets()
+        try:
+            oracle = get_btc_price()
+            dashboard.update_btc_price(oracle)
+        except Exception:
+            pass
+
+        try:
+            rounds = discover_active_btc_5m_markets()
+        except Exception as e:
+            dashboard.set_error(f"Market discovery failed: {e}")
+            rounds = []
+
         if not rounds:
             log.info("No active BTC 5-min markets found - retrying in 10s")
             _sleep(10)
             continue
 
+        dashboard.update_rounds(rounds)
         active_ids = {r.condition_id for r in rounds}
         tracker.cleanup(active_ids)
 
@@ -142,6 +170,8 @@ def main_loop():
 
         for rnd in rounds:
             if _shutdown:
+                break
+            if max_trades > 0 and trade_count >= max_trades:
                 break
 
             remaining = rnd.seconds_remaining
@@ -188,17 +218,45 @@ def main_loop():
 
             if result:
                 tracker.mark_traded(rnd.condition_id)
+                trade_count += 1
 
                 pnl = _estimate_pnl(signal)
                 won = pnl > 0
                 risk.record_pnl(won=won, pnl=pnl, direction=signal.direction)
 
+                dashboard.add_trade(TradeEntry(
+                    timestamp=time.time(),
+                    direction=signal.direction,
+                    action=signal.action,
+                    price=signal.price,
+                    size=signal.size,
+                    edge=signal.edge,
+                    confidence=signal.confidence,
+                    pnl=pnl,
+                    won=won,
+                    btc_price=signal.btc_current,
+                    condition_id=rnd.condition_id[:16],
+                    reason=signal.reason,
+                ))
+                dashboard.update_risk_stats(risk.stats_summary())
+                dashboard.add_log(
+                    "INFO",
+                    f"Trade #{trade_count}: {signal.action} edge={signal.edge:.3f} pnl=${pnl:.4f}",
+                )
+
+                log.info(
+                    "Trade %d/%s complete | PnL=$%.4f | Total PnL=$%.4f",
+                    trade_count, max_trades or "∞", pnl, risk.total_pnl(),
+                )
+
         _print_status(cycle, rounds)
+        dashboard.update_risk_stats(risk.stats_summary())
 
         sleep_time = _calculate_sleep(rounds)
         log.debug("Sleeping %.1fs until next check", sleep_time)
         _sleep(sleep_time)
 
+    dashboard.update_bot_status(False, cycle, trade_count, max_trades, mode)
     log.info("Bot shut down gracefully.")
     _print_final_stats()
 
@@ -217,6 +275,7 @@ def _capture_opening_price(tracker: RoundTracker, rnd: MarketRound):
         return
 
     oracle = get_btc_price()
+    dashboard.update_btc_price(oracle)
     price = oracle.get("chainlink") or oracle.get("median")
     if price:
         tracker.set_opening_price(rnd.condition_id, price)
@@ -289,9 +348,19 @@ def _print_final_stats():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Polymarket BTC 5-Min Trading Bot")
+    parser.add_argument(
+        "--max-trades", type=int, default=0,
+        help="Stop after N trades (0 = unlimited)",
+    )
+    args = parser.parse_args()
+
     print_banner()
+    if args.max_trades > 0:
+        print(f"   Will stop after {args.max_trades} trade(s).")
+        print()
     try:
-        main_loop()
+        main_loop(max_trades=args.max_trades)
     except KeyboardInterrupt:
         log.info("Interrupted by user")
         _print_final_stats()
