@@ -16,6 +16,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from src.bot_state import state as dashboard
+from src.config import LIVE_TRADING, PRIVATE_KEY
 
 logging.basicConfig(
     level=logging.INFO,
@@ -100,7 +101,15 @@ async def api_state():
 
 @app.get("/api/health")
 async def api_health():
-    return {"status": "ok", "bot_running": dashboard.running, "uptime": time.time() - dashboard.started_at if dashboard.started_at else 0}
+    """Public probe for Railway + quick check that LIVE_TRADING / wallet env are set."""
+    pk_ok = bool((PRIVATE_KEY or "").strip())
+    return {
+        "status": "ok",
+        "bot_running": dashboard.running,
+        "live_trading": LIVE_TRADING,
+        "private_key_configured": pk_ok,
+        "uptime": time.time() - dashboard.started_at if dashboard.started_at else 0,
+    }
 
 
 if __name__ == "__main__":
