@@ -1,26 +1,27 @@
 """
-Profit-Maximizing Strategy with Kelly-Optimal Sizing (v3)
+Profit-Maximizing Strategy with Kelly-Optimal Sizing (v4)
 =========================================================
-Key improvements over v2:
-  1. PROPER WIN PROBABILITY MODEL — combines multiple signals into a
-     calibrated probability rather than a vague "confidence" score.
-  2. KELLY-OPTIMAL POSITION SIZING — uses the bankroll-aware Kelly
-     Criterion to calculate the exact max to put down on each bet.
-  3. MOMENTUM PERSISTENCE — BTC price moves in the last 2-3 min of a
-     5-min window have high autocorrelation, meaning the direction at
-     t-60s strongly predicts the direction at t-0s.
-  4. VOLATILITY-ADJUSTED THRESHOLDS — in high-vol regimes, larger moves
-     are needed to signal conviction; in low-vol, smaller moves suffice.
-  5. MULTI-FACTOR EDGE — the edge is (estimated_win_prob - contract_price),
-     and we only bet when it's meaningfully positive.
+Key improvements over v3:
+  1. REALISTIC POLYMARKET FEES — crypto markets charge taker fees that eat
+     into edge. Fee formula: fee = C * p * 0.25 * (p*(1-p))^2
+     At p=0.50 the effective rate is 1.56%, dropping to near-zero at extremes.
+  2. FULL MARKET DATA — uses all CLOB endpoints: /book, /midpoint, /spread,
+     /last-trade-price, /fee-rate, /tick-size for accurate pricing.
+  3. FEE-ADJUSTED KELLY — the Kelly fraction now accounts for the fee on entry,
+     so the "effective price" (price + fee) is used for sizing.
+  4. MIN ORDER SIZE enforcement from the order book.
+  5. DISPLAY PRICE logic matching Polymarket (midpoint if spread <= $0.10,
+     last_trade_price if wider).
 
-For a binary contract paying $1.00:
+For a binary contract paying $1.00 with crypto fees:
   - You pay `price` per contract
-  - If win:  +$(1 - price) per contract
-  - If lose: -$(price) per contract
-  - Kelly fraction: f* = (win_prob - price) / (1 - price)
-  - We use half-Kelly by default to reduce variance while still
-    capturing ~75% of the growth rate of full Kelly.
+  - Fee per contract: price * effective_fee_rate(price)
+  - Effective cost: price / (1 - effective_fee_rate)  [fee is taken in shares]
+  - If win:  $1.00 per contract received
+  - If lose: lose the effective cost
+  - Kelly: f* = (win_prob - effective_price) / (1 - effective_price)
+
+Source: https://docs.polymarket.com/trading/fees
 """
 
 import logging
@@ -41,7 +42,7 @@ from src.config import (
     CONFIDENCE_FLOOR,
     STARTING_BANKROLL,
 )
-from src.market_reader import MarketRound, get_order_book_prices
+from src.market_reader import MarketRound, get_full_market_data
 from src.price_oracle import get_btc_price
 from src.kelly import (
     kelly_criterion,
@@ -50,6 +51,7 @@ from src.kelly import (
     load_bankroll,
     save_bankroll,
 )
+from src.fees import effective_fee_rate, calculate_crypto_fee
 
 log = logging.getLogger(__name__)
 
@@ -85,7 +87,7 @@ class Signal:
     token_id: str
     price: float             # limit price to place the order at
     size: float              # number of contracts (shares)
-    edge: float              # win_prob - contract_price
+    edge: float              # win_prob - effective_price (fee-adjusted)
     confidence: float        # estimated win probability (0-1)
     direction: str           # "up" or "down"
     btc_current: float
@@ -98,6 +100,9 @@ class Signal:
     bet_dollars: float = 0.0
     expected_profit: float = 0.0
     bankroll_snapshot: float = 0.0
+    fee_rate_pct: float = 0.0
+    effective_price: float = 0.0
+    min_order_size: float = 5.0
 
 
 def evaluate_round(
@@ -156,14 +161,16 @@ def evaluate_round(
         log.info("Win probability %.3f below floor %.3f - skipping", win_prob, CONFIDENCE_FLOOR)
         return None
 
+    # --- Fetch FULL market data from all CLOB endpoints ---
     token_id = rnd.up_token_id if direction == "up" else rnd.down_token_id
-    book = get_order_book_prices(token_id)
-    limit_price = _determine_limit_price(book, win_prob, remaining)
+    market = get_full_market_data(token_id)
+
+    limit_price = _determine_limit_price(market, win_prob, remaining)
 
     if limit_price is None:
         log.info(
-            "No viable limit price (bid=%.3f ask=%.3f) - skipping",
-            book["best_bid"], book["best_ask"],
+            "No viable limit price (bid=%.3f ask=%.3f spread=%.3f) - skipping",
+            market["best_bid"], market["best_ask"], market["spread"],
         )
         return None
 
@@ -174,18 +181,24 @@ def evaluate_round(
         )
         return None
 
-    edge = win_prob - limit_price
+    # --- Calculate fee-adjusted edge ---
+    fee_rate = effective_fee_rate(limit_price)
+    eff_price = limit_price / (1.0 - fee_rate) if fee_rate < 1.0 else limit_price
+
+    edge = win_prob - eff_price
     if edge < MIN_EDGE:
         log.info(
-            "Edge %.4f (win_prob=%.3f - price=%.3f) below threshold %.3f",
-            edge, win_prob, limit_price, MIN_EDGE,
+            "Fee-adjusted edge %.4f (win_prob=%.3f - eff_price=%.3f [raw=%.3f + fee=%.2f%%]) "
+            "below threshold %.3f",
+            edge, win_prob, eff_price, limit_price, fee_rate * 100, MIN_EDGE,
         )
         return None
 
+    # --- Kelly sizing with fee-adjusted effective price ---
     br = get_bankroll()
     rec = kelly_criterion(
         win_prob=win_prob,
-        contract_price=limit_price,
+        contract_price=eff_price,
         bankroll=br.current_balance,
         kelly_multiplier=KELLY_MULTIPLIER,
         min_bet_dollars=MIN_BET_DOLLARS,
@@ -193,6 +206,15 @@ def evaluate_round(
 
     if not rec.should_bet:
         log.info("Kelly says no bet: %s", rec.reason)
+        return None
+
+    # --- Enforce Polymarket min_order_size ---
+    min_size = market["min_order_size"]
+    if rec.num_contracts < min_size:
+        log.info(
+            "Kelly size %.1f contracts below Polymarket min_order_size %.1f - skipping",
+            rec.num_contracts, min_size,
+        )
         return None
 
     size = rec.num_contracts
@@ -209,18 +231,26 @@ def evaluate_round(
         btc_current=current_price,
         btc_opening=opening_btc_price,
         seconds_remaining=remaining,
-        neg_risk=rnd.neg_risk,
-        tick_size=rnd.tick_size,
+        neg_risk=market["neg_risk"],
+        tick_size=market["tick_size"],
         kelly_fraction=rec.adj_kelly_fraction,
         bet_dollars=rec.bet_dollars,
         expected_profit=rec.expected_profit,
         bankroll_snapshot=br.current_balance,
+        fee_rate_pct=fee_rate * 100,
+        effective_price=eff_price,
+        min_order_size=min_size,
         reason=(
             f"BTC {'UP' if direction == 'up' else 'DN'} "
             f"${price_delta:+.2f} ({pct_move*100:.4f}%) | "
-            f"P(win)={win_prob:.3f} edge={edge:.4f} | "
-            f"limit=${limit_price:.3f} bid=${book['best_bid']:.3f} ask=${book['best_ask']:.3f} | "
-            f"Kelly={rec.adj_kelly_fraction:.4f} -> ${rec.bet_dollars:.2f} ({size:.1f} contracts) | "
+            f"P(win)={win_prob:.3f} edge={edge:.4f} (fee-adj) | "
+            f"limit=${limit_price:.3f} eff=${eff_price:.3f} fee={fee_rate*100:.2f}% | "
+            f"bid=${market['best_bid']:.3f} ask=${market['best_ask']:.3f} "
+            f"spread=${market['spread']:.3f} last=${market['last_trade_price']:.3f} | "
+            f"Kelly={rec.adj_kelly_fraction:.4f} -> ${rec.bet_dollars:.2f} "
+            f"({size:.1f} contracts, min={min_size:.0f}) | "
+            f"depth={market['bid_depth']:.0f}/{market['ask_depth']:.0f} "
+            f"levels={market['book_levels']} | "
             f"EV=${rec.expected_profit:.4f} | bankroll=${br.current_balance:.2f} | "
             f"{remaining:.0f}s left"
         ),
@@ -241,35 +271,21 @@ def _estimate_win_probability(
     """
     Multi-factor win probability estimation.
 
-    In a 5-minute BTC binary, the question is: will the closing price be
-    above or below the opening price? By combining multiple orthogonal
-    signals, we get a calibrated probability estimate.
-
     Factors:
-    1. MOMENTUM MAGNITUDE — larger moves are more likely to persist
-    2. TIME DECAY — less time remaining = less time for reversal
-    3. MOMENTUM CONSISTENCY — is the move accelerating or decelerating?
-    4. ORACLE AGREEMENT — do all price sources agree on direction?
-    5. CHAINLINK AUTHORITY — Chainlink is the resolution source
+    1. MOMENTUM MAGNITUDE -- larger moves are more likely to persist
+    2. TIME DECAY -- less time remaining = less time for reversal
+    3. MOMENTUM CONSISTENCY -- is the move accelerating or decelerating?
+    4. ORACLE AGREEMENT -- do all price sources agree on direction?
+    5. CHAINLINK AUTHORITY -- Chainlink is the resolution source
     """
 
-    # --- Factor 1: Momentum magnitude ---
-    # BTC 5-min moves: 0.01% is noise, 0.05% is moderate, 0.15%+ is strong
-    # Sigmoid mapping from pct_move to probability contribution
     magnitude_signal = _sigmoid(pct_move, midpoint=0.0004, steepness=8000)
 
-    # --- Factor 2: Time decay ---
-    # With 180s left, direction is ~55% reliable
-    # With 30s left, direction is ~85% reliable
-    # With 5s left, direction is ~95% reliable (market already priced in)
     time_fraction = 1.0 - (seconds_remaining / 300.0)
     time_signal = 0.50 + 0.45 * _sigmoid(time_fraction, midpoint=0.6, steepness=8)
 
-    # --- Factor 3: Momentum consistency ---
-    # Check if recent price samples show consistent direction
     consistency = _momentum_consistency(direction)
 
-    # --- Factor 4: Oracle agreement ---
     prices = oracle["sources"]
     if len(prices) >= 2:
         vals = list(prices.values())
@@ -287,7 +303,6 @@ def _estimate_win_probability(
     else:
         agreement = 0.5
 
-    # --- Factor 5: Chainlink authority bonus ---
     chainlink = oracle.get("chainlink")
     if chainlink is not None:
         chainlink_agrees = (
@@ -298,14 +313,12 @@ def _estimate_win_probability(
     else:
         chainlink_bonus = 0.0
 
-    # --- Combine factors ---
-    # Weighted combination tuned for these binary BTC rounds
     raw_prob = (
         magnitude_signal * 0.25
         + time_signal * 0.30
         + consistency * 0.20
         + agreement * 0.15
-        + 0.10  # base rate (prior: any direction is ~50/50 before signals)
+        + 0.10
     ) + chainlink_bonus
 
     raw_prob = max(0.01, min(0.99, raw_prob))
@@ -355,7 +368,7 @@ def _recent_volatility() -> float:
     Returns the standard deviation of returns as a fraction.
     """
     if len(_price_history) < 5:
-        return 0.0003  # default: moderate vol
+        return 0.0003
 
     recent = list(_price_history)[-30:]
     if len(recent) < 5:
@@ -378,8 +391,6 @@ def _dynamic_move_threshold(volatility: float) -> float:
     """
     In high-vol regimes, require a larger move to be confident.
     In low-vol regimes, even small moves are meaningful.
-
-    Returns the minimum pct_move to generate a signal.
     """
     base = 0.00003
     vol_scaled = volatility * 0.8
@@ -387,48 +398,54 @@ def _dynamic_move_threshold(volatility: float) -> float:
 
 
 def _determine_limit_price(
-    book: dict,
+    market: dict,
     win_prob: float,
     remaining: float,
 ) -> Optional[float]:
     """
-    Determine the limit price that maximizes expected profit.
+    Determine the limit price that maximizes expected profit after fees.
 
-    The key insight: we want to buy as CHEAPLY as possible.
-    Lower price = higher edge = higher Kelly fraction = more profit.
-    But too low a price means we won't get filled.
+    Uses realistic Polymarket market data: best_bid, best_ask, display_price,
+    last_trade_price, and spread to determine the best entry.
 
-    Strategy:
-    - If ask is below our maximum acceptable price, buy at ask (guaranteed fill)
-    - Otherwise, place a bid that balances fill probability vs edge
+    Your order price must conform to the market's tick size.
     """
-    best_bid = book["best_bid"]
-    best_ask = book["best_ask"]
-    mid = book["mid"]
+    best_bid = market["best_bid"]
+    best_ask = market["best_ask"]
+    display_price = market["display_price"]
+    last_trade = market["last_trade_price"]
+    spread = market["spread"]
 
-    # The maximum we'd pay is where edge becomes zero: price = win_prob
-    # But we want at least MIN_EDGE of edge, so max_price = win_prob - MIN_EDGE
-    max_acceptable = min(MAX_CONTRACT_PRICE, win_prob - MIN_EDGE)
+    fee_rate = effective_fee_rate(display_price)
+    max_raw_price = win_prob * (1.0 - fee_rate) - MIN_EDGE
+    max_acceptable = min(MAX_CONTRACT_PRICE, max_raw_price)
 
     if max_acceptable < MIN_CONTRACT_PRICE:
         return None
 
-    if best_ask > 0 and best_ask <= max_acceptable:
-        return best_ask
+    tick = float(market["tick_size"])
 
-    # Try to get a better price by bidding between bid and ask
-    if mid > 0 and mid <= max_acceptable:
-        # Bid slightly above mid — closer to mid = more edge, less fill chance
+    if best_ask > 0 and best_ask <= max_acceptable:
+        return _snap_to_tick(best_ask, tick)
+
+    if spread <= 0.10 and display_price > 0 and display_price <= max_acceptable:
         urgency = max(0.0, 1.0 - remaining / 120.0)
-        offset = (best_ask - mid) * 0.3 * urgency if best_ask > mid else 0
-        price = min(mid + offset, max_acceptable)
-        return max(MIN_CONTRACT_PRICE, price)
+        offset = (best_ask - display_price) * 0.3 * urgency if best_ask > display_price else 0
+        price = min(display_price + offset, max_acceptable)
+        return _snap_to_tick(max(MIN_CONTRACT_PRICE, price), tick)
+
+    if last_trade > 0 and last_trade <= max_acceptable:
+        return _snap_to_tick(last_trade, tick)
 
     if best_bid > 0 and best_bid < max_acceptable:
-        # Tight spread or wide — step up from bid
         step = min(0.03, (max_acceptable - best_bid) * 0.5)
-        return min(best_bid + step, max_acceptable)
+        return _snap_to_tick(min(best_bid + step, max_acceptable), tick)
 
     return None
 
 
+def _snap_to_tick(price: float, tick: float) -> float:
+    """Round a price down to the nearest valid tick increment."""
+    if tick <= 0:
+        return price
+    return round(math.floor(price / tick) * tick, 4)

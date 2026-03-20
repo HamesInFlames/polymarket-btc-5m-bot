@@ -35,6 +35,7 @@ from src.price_oracle import get_btc_price
 from src.strategy import evaluate_round, get_bankroll, record_bet_result
 from src.risk_manager import RiskManager
 from src.trader import place_buy_order
+from src.fees import effective_fee_rate
 from src.bot_state import state as dashboard, TradeEntry, install_log_handler
 
 logging.basicConfig(
@@ -79,7 +80,8 @@ def print_banner():
     print(f"   Bet sizing:          UNRESTRICTED (Kelly decides)")
     print(f"   Profit reinvestment: 100% (max compounding)")
     print(f"   Trade limits:        NONE (runs forever)")
-    print(f"   Min edge threshold:  {MIN_EDGE*100:.1f}%")
+    print(f"   Min edge threshold:  {MIN_EDGE*100:.1f}% (after Polymarket fees)")
+    print(f"   Crypto fee at 50c:   ~1.56% (auto-fetched per token)")
     print(f"   Entry window:        {ENTRY_WINDOW_START}s -> {ENTRY_WINDOW_END}s before close")
     if br.num_bets > 0:
         print(f"   Lifetime bets:       {br.num_bets} ({br.win_rate*100:.1f}% win rate)")
@@ -194,10 +196,12 @@ def main_loop():
                 continue
 
             log.info(
-                ">>> EXECUTING: %s on %s | P(win)=%.3f edge=%.4f | "
+                ">>> EXECUTING: %s on %s | P(win)=%.3f edge=%.4f (fee-adj) | "
+                "price=$%.3f eff=$%.3f fee=%.2f%% | "
                 "Kelly=%.4f -> $%.2f (%.1f contracts @ $%.3f) | EV=$%.4f",
                 signal.action, rnd.condition_id[:12],
                 signal.confidence, signal.edge,
+                signal.price, signal.effective_price, signal.fee_rate_pct,
                 signal.kelly_fraction, signal.bet_dollars,
                 signal.size, signal.price, signal.expected_profit,
             )
@@ -208,6 +212,8 @@ def main_loop():
                 size=signal.size,
                 neg_risk=signal.neg_risk,
                 tick_size=signal.tick_size,
+                order_type="FAK",
+                min_order_size=signal.min_order_size,
             )
 
             if result:
@@ -297,14 +303,25 @@ def _estimate_pnl(signal) -> tuple[float, bool]:
     In dry-run mode we simulate a REAL binary outcome using the
     estimated win probability. The bet either wins or loses —
     no expected-value smoothing — so paper results reflect real variance.
+
+    Accounts for Polymarket crypto fees:
+      - Fee is taken in shares on buy (fewer contracts received)
+      - Effective contracts = size * (1 - effective_fee_rate)
+      - Win payout: effective_contracts * $1.00
+      - Loss: -bet_dollars (USDC already paid)
+
     For live mode, the actual PnL comes from contract resolution.
 
     Returns (pnl_dollars, won).
     """
     if not LIVE_TRADING:
         won = random.random() < signal.confidence
+        fee_rate = effective_fee_rate(signal.price)
+        effective_contracts = signal.size * (1.0 - fee_rate)
+
         if won:
-            profit = signal.size * (1.0 - signal.price)
+            payout = effective_contracts * 1.0
+            profit = payout - signal.bet_dollars
             return profit, True
         else:
             return -signal.bet_dollars, False
@@ -370,9 +387,7 @@ def _print_final_stats():
     print(f"  ROI:                {br.roi*100:+.1f}%")
     print(f"  Drawdown:           {br.drawdown*100:.1f}%")
     print(f"  Total wagered:      ${br.total_wagered:.2f}")
-    print(f"  Paused:             {stats['paused']}")
-    if stats["pause_reason"]:
-        print(f"  Pause reason:       {stats['pause_reason']}")
+    print(f"  Fee model:          Polymarket crypto (max 1.56% at 50c)")
     print("=" * 58)
     print()
 
