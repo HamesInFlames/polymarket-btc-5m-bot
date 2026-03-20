@@ -65,6 +65,22 @@ body{
 .header-right{display:flex;align-items:center;gap:.75rem;font-size:.8rem;color:var(--text-dim)}
 .uptime{font-family:'JetBrains Mono',monospace}
 
+/* ── Connection indicator ─────────────────────────── */
+.conn-status{
+  display:flex;align-items:center;gap:.35rem;
+  font-size:.7rem;font-weight:600;
+  font-family:'JetBrains Mono',monospace;
+  padding:.2rem .6rem;border-radius:9999px;
+  transition:all .3s ease;
+}
+.conn-status.connected{color:var(--green);background:var(--green-bg);border:1px solid rgba(34,197,94,.2)}
+.conn-status.connecting{color:var(--amber);background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2)}
+.conn-status.disconnected{color:var(--red);background:var(--red-bg);border:1px solid rgba(239,68,68,.2)}
+.conn-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.conn-status.connected .conn-dot{background:var(--green);animation:pulse 2s infinite}
+.conn-status.connecting .conn-dot{background:var(--amber);animation:pulse .8s infinite}
+.conn-status.disconnected .conn-dot{background:var(--red)}
+
 /* ── Layout ───────────────────────────────────────── */
 .container{max-width:1440px;margin:0 auto;padding:1.25rem}
 .grid-top{display:grid;grid-template-columns:repeat(5,1fr);gap:.75rem;margin-bottom:1rem}
@@ -81,12 +97,32 @@ body{
 }
 .card:hover{border-color:var(--border-hl)}
 .card-label{font-size:.7rem;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:.35rem}
-.card-value{font-family:'JetBrains Mono',monospace;font-size:1.5rem;font-weight:700;line-height:1.2}
+.card-value{
+  font-family:'JetBrains Mono',monospace;font-size:1.5rem;font-weight:700;line-height:1.2;
+  transition:color .3s ease;
+}
 .card-sub{font-size:.72rem;color:var(--text-muted);margin-top:.25rem;font-family:'JetBrains Mono',monospace}
 .card-value.green{color:var(--green)}
 .card-value.red{color:var(--red)}
 .card-value.blue{color:var(--blue)}
 .card-value.amber{color:var(--amber)}
+
+/* ── Flash animation for value changes ────────────── */
+@keyframes flash-green{
+  0%{background:rgba(34,197,94,.2)}
+  100%{background:transparent}
+}
+@keyframes flash-red{
+  0%{background:rgba(239,68,68,.2)}
+  100%{background:transparent}
+}
+@keyframes flash-neutral{
+  0%{background:rgba(59,130,246,.15)}
+  100%{background:transparent}
+}
+.flash-green{animation:flash-green .8s ease-out}
+.flash-red{animation:flash-red .8s ease-out}
+.flash-neutral{animation:flash-neutral .8s ease-out}
 
 /* ── Tables ───────────────────────────────────────── */
 .section-title{font-size:.8rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.65rem;color:var(--text-dim)}
@@ -107,6 +143,16 @@ tr:hover td{background:rgba(59,130,246,.03)}
 .tag-win{background:var(--green-bg);color:var(--green)}
 .tag-loss{background:var(--red-bg);color:var(--red)}
 
+/* ── Round countdown ─────────────────────────────── */
+.countdown{
+  font-family:'JetBrains Mono',monospace;
+  font-weight:600;font-size:.8rem;
+  transition:color .3s;
+}
+.countdown.urgent{color:var(--red);animation:pulse .6s infinite}
+.countdown.soon{color:var(--amber)}
+.countdown.normal{color:var(--text)}
+
 /* ── Progress bars ────────────────────────────────── */
 .progress-bar{
   height:4px;border-radius:2px;background:var(--border);
@@ -117,6 +163,16 @@ tr:hover td{background:rgba(59,130,246,.03)}
 .progress-fill.red{background:linear-gradient(90deg,var(--red-dim),var(--red))}
 .progress-fill.blue{background:linear-gradient(90deg,var(--blue-dim),var(--blue))}
 .progress-fill.amber{background:linear-gradient(90deg,#d97706,var(--amber))}
+
+/* ── Round time progress bar ─────────────────────── */
+.round-progress{
+  height:3px;border-radius:1.5px;background:var(--border);
+  overflow:hidden;margin-top:.2rem;width:100%;
+}
+.round-progress-fill{
+  height:100%;border-radius:1.5px;
+  transition:width 1s linear, background .5s;
+}
 
 /* ── Log panel ────────────────────────────────────── */
 .log-panel{
@@ -133,6 +189,7 @@ tr:hover td{background:rgba(59,130,246,.03)}
 .log-lvl.INFO{color:var(--blue)}
 .log-lvl.WARN{color:var(--amber)}
 .log-lvl.ERROR{color:var(--red)}
+.log-new{animation:flash-neutral .6s ease-out}
 
 /* ── PnL Chart ────────────────────────────────────── */
 .chart-area{position:relative;height:180px;overflow:hidden}
@@ -145,11 +202,18 @@ canvas{width:100%!important;height:100%!important}
   background:var(--surface2);border:1px solid var(--border);
   border-radius:6px;padding:.2rem .5rem;
   color:var(--text-dim);
+  transition:border-color .3s;
 }
 .source-chip strong{color:var(--text);font-weight:600}
 
 /* ── Empty state ──────────────────────────────────── */
 .empty{text-align:center;padding:2rem;color:var(--text-muted);font-size:.8rem}
+
+/* ── Last updated ticker ─────────────────────────── */
+.last-update{
+  font-size:.65rem;color:var(--text-muted);
+  font-family:'JetBrains Mono',monospace;
+}
 
 /* ── Responsive ───────────────────────────────────── */
 @media(max-width:1100px){
@@ -173,9 +237,14 @@ canvas{width:100%!important;height:100%!important}
     <span class="badge badge-dry" id="mode-badge"><span class="pulse pulse-blue" id="mode-pulse"></span><span id="mode-text">LOADING</span></span>
   </div>
   <div class="header-right">
+    <div class="conn-status connecting" id="conn-status">
+      <span class="conn-dot"></span>
+      <span id="conn-text">CONNECTING</span>
+    </div>
     <span>Cycle <strong id="h-cycle">—</strong></span>
     <span>|</span>
     <span class="uptime" id="h-uptime">00:00:00</span>
+    <span class="last-update" id="last-update"></span>
   </div>
 </div>
 
@@ -184,13 +253,13 @@ canvas{width:100%!important;height:100%!important}
 
   <!-- Top stat cards -->
   <div class="grid-top">
-    <div class="card">
+    <div class="card" id="card-btc">
       <div class="card-label">BTC / USD</div>
       <div class="card-value" id="btc-price">—</div>
       <div class="card-sub" id="btc-age">—</div>
       <div class="sources" id="btc-sources"></div>
     </div>
-    <div class="card">
+    <div class="card" id="card-pnl">
       <div class="card-label">Total PnL</div>
       <div class="card-value" id="total-pnl">$0.0000</div>
       <div class="card-sub" id="daily-pnl">Daily: $0.0000</div>
@@ -270,12 +339,20 @@ canvas{width:100%!important;height:100%!important}
 </div>
 
 <script>
-const API = '/api/state';
-const POLL_MS = 3000;
+/* ── State ──────────────────────────────────────── */
+let lastData = null;
+let prevValues = {};
+let prevLogCount = 0;
+let prevTradeCount = 0;
+let ws = null;
+let reconnectDelay = 1000;
+let reconnectTimer = null;
+let uptimeBase = 0;
+let uptimeStart = 0;
+let roundEndTimestamps = [];
+let tickInterval = null;
 
-let pnlHistory = [];
-let chartCtx = null;
-
+/* ── Formatters ─────────────────────────────────── */
 function fmt$(v, d=4){ return (v>=0?'+':'')+v.toFixed(d); }
 function fmtTime(sec){
   if(sec<=0) return '0s';
@@ -290,282 +367,456 @@ function fmtTimestamp(ts){
   const d=new Date(ts*1000);
   return d.toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
 }
-
-function updateHeader(data){
-  const bot=data.bot;
-  const badge=document.getElementById('mode-badge');
-  const pulse=document.getElementById('mode-pulse');
-  const modeText=document.getElementById('mode-text');
-
-  if(!bot.running){
-    badge.className='badge badge-off';
-    pulse.className='pulse pulse-red';
-    modeText.textContent='OFFLINE';
-  } else if(bot.mode==='LIVE'){
-    badge.className='badge badge-live';
-    pulse.className='pulse pulse-green';
-    modeText.textContent='LIVE';
-  } else {
-    badge.className='badge badge-dry';
-    pulse.className='pulse pulse-blue';
-    modeText.textContent='PAPER';
-  }
-
-  document.getElementById('h-cycle').textContent=bot.cycle||'—';
-  document.getElementById('h-uptime').textContent=fmtUptime(bot.uptime_seconds||0);
-}
-
-function updateCards(data){
-  const btc=data.btc, stats=data.stats, bot=data.bot;
-
-  // BTC price
-  const btcEl=document.getElementById('btc-price');
-  if(btc.price>0){
-    btcEl.textContent='$'+btc.price.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
-  } else {
-    btcEl.textContent='—';
-  }
-
-  const ageEl=document.getElementById('btc-age');
-  if(btc.age_seconds>=0){
-    ageEl.textContent=btc.age_seconds<5?'Just now':`${Math.floor(btc.age_seconds)}s ago`;
-  }
-
-  // BTC sources
-  const srcEl=document.getElementById('btc-sources');
-  srcEl.innerHTML='';
-  for(const[name,price]of Object.entries(btc.sources||{})){
-    srcEl.innerHTML+=`<span class="source-chip"><strong>${name}</strong> $${price.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}</span>`;
-  }
-
-  // PnL
-  const pnlEl=document.getElementById('total-pnl');
-  pnlEl.textContent='$'+fmt$(stats.total_pnl);
-  pnlEl.className='card-value '+(stats.total_pnl>=0?'green':'red');
-
-  const dailyEl=document.getElementById('daily-pnl');
-  dailyEl.textContent='Daily: $'+fmt$(stats.daily_pnl);
-
-  // Win rate
-  const wr=stats.win_rate*100;
-  document.getElementById('win-rate').textContent=wr.toFixed(1)+'%';
-  document.getElementById('wr-bar').style.width=wr+'%';
-  document.getElementById('win-loss').textContent=`${stats.wins}W / ${stats.losses}L`;
-
-  // Trades
-  document.getElementById('trade-count').textContent=bot.trade_count;
-  document.getElementById('trade-limit').textContent=bot.max_trades>0?`of ${bot.max_trades}`:'of ∞';
-
-  // Risk
-  const riskEl=document.getElementById('risk-status');
-  const clEl=document.getElementById('consec-losses');
-  if(stats.paused){
-    riskEl.textContent='PAUSED';
-    riskEl.className='card-value red';
-    clEl.textContent=stats.pause_reason||'Unknown';
-  } else {
-    riskEl.textContent='OK';
-    riskEl.className='card-value green';
-    clEl.textContent=`Consec. losses: ${stats.consecutive_losses}`;
-  }
-}
-
-function updateRounds(data){
-  const tbody=document.getElementById('rounds-body');
-  const rounds=data.rounds||[];
-  if(!rounds.length){
-    tbody.innerHTML='<tr><td colspan="5" class="empty">No active rounds</td></tr>';
-    return;
-  }
-  let html='';
-  for(const r of rounds){
-    const rem=r.end_timestamp - Date.now()/1000;
-    const remDisp=rem>0?fmtTime(rem):'Expired';
-    const status=rem<=5?'<span class="tag tag-down">CLOSING</span>':rem<=60?'<span class="tag tag-up">ENTRY</span>':'<span style="color:var(--text-dim)">Waiting</span>';
-    html+=`<tr>
-      <td title="${r.condition_id}">${r.slug||r.condition_id}</td>
-      <td>${remDisp}</td>
-      <td>$${(r.up_price||0).toFixed(3)}</td>
-      <td>$${(r.down_price||0).toFixed(3)}</td>
-      <td>${status}</td>
-    </tr>`;
-  }
-  tbody.innerHTML=html;
-}
-
-function updateTrades(data){
-  const tbody=document.getElementById('trades-body');
-  const trades=(data.trades||[]).slice().reverse();
-  if(!trades.length){
-    tbody.innerHTML='<tr><td colspan="8" class="empty">No trades yet</td></tr>';
-    return;
-  }
-  let html='';
-  for(const t of trades){
-    const dirTag=t.direction==='up'?'<span class="tag tag-up">UP</span>':'<span class="tag tag-down">DN</span>';
-    const resTag=t.won?'<span class="tag tag-win">WIN</span>':'<span class="tag tag-loss">LOSS</span>';
-    const pnlColor=t.pnl>=0?'var(--green)':'var(--red)';
-    html+=`<tr>
-      <td>${fmtTimestamp(t.timestamp)}</td>
-      <td>${dirTag}</td>
-      <td>$${t.price.toFixed(3)}</td>
-      <td>${t.size.toFixed(2)}</td>
-      <td>${(t.edge*100).toFixed(1)}%</td>
-      <td>${(t.confidence*100).toFixed(0)}%</td>
-      <td style="color:${pnlColor}">$${fmt$(t.pnl)}</td>
-      <td>${resTag}</td>
-    </tr>`;
-  }
-  tbody.innerHTML=html;
-}
-
-function updateLog(data){
-  const panel=document.getElementById('log-panel');
-  const logs=data.logs||[];
-  if(!logs.length){
-    panel.innerHTML='<div class="empty">Waiting for log output...</div>';
-    return;
-  }
-  const atBottom=panel.scrollHeight-panel.scrollTop-panel.clientHeight<40;
-  let html='';
-  for(const l of logs){
-    html+=`<div class="log-line"><span class="log-ts">${fmtTimestamp(l.ts)}</span><span class="log-lvl ${l.level}">${l.level}</span><span>${escHtml(l.msg)}</span></div>`;
-  }
-  panel.innerHTML=html;
-  if(atBottom) panel.scrollTop=panel.scrollHeight;
-}
-
 function escHtml(s){
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-/* ── Mini PnL chart (pure canvas, no deps) ─────── */
-function drawPnlChart(data){
-  const trades=data.trades||[];
-  if(!trades.length) return;
+/* ── Flash helper: flash a card when value changes ── */
+function flashIfChanged(key, newVal, el, flashClass){
+  if(prevValues[key] !== undefined && prevValues[key] !== newVal){
+    el.classList.remove('flash-green','flash-red','flash-neutral');
+    void el.offsetWidth;
+    el.classList.add(flashClass || 'flash-neutral');
+  }
+  prevValues[key] = newVal;
+}
 
-  let cumPnl=0;
-  pnlHistory=[];
-  for(const t of trades){
-    cumPnl+=t.pnl;
-    pnlHistory.push({x:t.timestamp,y:cumPnl,won:t.won});
+/* ── Connection status ──────────────────────────── */
+function setConnStatus(state){
+  const el = document.getElementById('conn-status');
+  const txt = document.getElementById('conn-text');
+  el.className = 'conn-status ' + state;
+  txt.textContent = state === 'connected' ? 'LIVE' : state === 'connecting' ? 'CONNECTING' : 'DISCONNECTED';
+}
+
+/* ── WebSocket ──────────────────────────────────── */
+function connectWS(){
+  if(ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+
+  setConnStatus('connecting');
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+  ws.onopen = () => {
+    setConnStatus('connected');
+    reconnectDelay = 1000;
+    document.getElementById('last-update').textContent = '';
+  };
+
+  ws.onmessage = (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      lastData = data;
+      onData(data);
+    } catch(err) {
+      console.warn('WS parse error:', err);
+    }
+  };
+
+  ws.onclose = () => {
+    setConnStatus('disconnected');
+    scheduleReconnect();
+  };
+
+  ws.onerror = () => {
+    ws.close();
+  };
+}
+
+function scheduleReconnect(){
+  if(reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    reconnectDelay = Math.min(reconnectDelay * 1.5, 10000);
+    connectWS();
+  }, reconnectDelay);
+}
+
+/* ── Tick: runs every second for countdowns + uptime ── */
+function startTick(){
+  if(tickInterval) clearInterval(tickInterval);
+  tickInterval = setInterval(() => {
+    tickUptime();
+    tickRoundCountdowns();
+    tickBtcAge();
+  }, 1000);
+}
+
+function tickUptime(){
+  if(!uptimeStart) return;
+  const elapsed = (Date.now() - uptimeStart) / 1000;
+  const uptime = uptimeBase + elapsed;
+  document.getElementById('h-uptime').textContent = fmtUptime(uptime);
+}
+
+function tickBtcAge(){
+  if(!lastData || !lastData.btc) return;
+  const age = lastData.btc.age_seconds;
+  if(age < 0) return;
+  const serverTime = Date.now() / 1000;
+  const updatedAt = lastData.btc.updated_at;
+  if(!updatedAt) return;
+  const currentAge = serverTime - updatedAt;
+  const ageEl = document.getElementById('btc-age');
+  ageEl.textContent = currentAge < 2 ? 'Just now' : `${Math.floor(currentAge)}s ago`;
+}
+
+function tickRoundCountdowns(){
+  const now = Date.now() / 1000;
+  for(const r of roundEndTimestamps){
+    const el = document.getElementById(r.elId);
+    if(!el) continue;
+    const rem = r.endTs - now;
+    if(rem <= 0){
+      el.textContent = '0s';
+      el.className = 'countdown urgent';
+    } else {
+      el.textContent = fmtTime(rem);
+      if(rem <= 10) el.className = 'countdown urgent';
+      else if(rem <= 60) el.className = 'countdown soon';
+      else el.className = 'countdown normal';
+    }
+
+    const progEl = document.getElementById(r.progId);
+    if(progEl){
+      const totalDuration = 300;
+      const pct = Math.max(0, Math.min(100, (rem / totalDuration) * 100));
+      progEl.style.width = pct + '%';
+      if(rem <= 10) progEl.style.background = 'var(--red)';
+      else if(rem <= 60) progEl.style.background = 'var(--amber)';
+      else progEl.style.background = 'var(--blue)';
+    }
+
+    const statusEl = document.getElementById(r.statusId);
+    if(statusEl){
+      if(rem <= 5) statusEl.innerHTML = '<span class="tag tag-down">CLOSING</span>';
+      else if(rem <= 60) statusEl.innerHTML = '<span class="tag tag-up">ENTRY</span>';
+      else statusEl.innerHTML = '<span style="color:var(--text-dim)">Waiting</span>';
+    }
+  }
+}
+
+/* ── Master data handler ─────────────────────────── */
+function onData(data){
+  updateHeader(data);
+  updateCards(data);
+  updateRounds(data);
+  updateTrades(data);
+  updateLog(data);
+  drawPnlChart(data);
+}
+
+/* ── Header ──────────────────────────────────────── */
+function updateHeader(data){
+  const bot = data.bot;
+  const badge = document.getElementById('mode-badge');
+  const pulse = document.getElementById('mode-pulse');
+  const modeText = document.getElementById('mode-text');
+
+  if(!bot.running){
+    badge.className = 'badge badge-off';
+    pulse.className = 'pulse pulse-red';
+    modeText.textContent = 'OFFLINE';
+  } else if(bot.mode === 'LIVE'){
+    badge.className = 'badge badge-live';
+    pulse.className = 'pulse pulse-green';
+    modeText.textContent = 'LIVE';
+  } else {
+    badge.className = 'badge badge-dry';
+    pulse.className = 'pulse pulse-blue';
+    modeText.textContent = 'PAPER';
   }
 
-  const canvas=document.getElementById('pnl-chart');
-  const rect=canvas.parentElement.getBoundingClientRect();
-  canvas.width=rect.width*2;
-  canvas.height=rect.height*2;
-  const ctx=canvas.getContext('2d');
-  ctx.scale(2,2);
-  const W=rect.width, H=rect.height;
+  document.getElementById('h-cycle').textContent = bot.cycle || '—';
 
-  ctx.clearRect(0,0,W,H);
+  uptimeBase = bot.uptime_seconds || 0;
+  uptimeStart = Date.now();
+  document.getElementById('h-uptime').textContent = fmtUptime(uptimeBase);
+}
 
-  if(pnlHistory.length<2){
-    ctx.fillStyle='#475569';
-    ctx.font='12px Inter, sans-serif';
-    ctx.textAlign='center';
-    ctx.fillText('Need 2+ trades to draw chart',W/2,H/2);
+/* ── Cards ───────────────────────────────────────── */
+function updateCards(data){
+  const btc = data.btc, stats = data.stats, bot = data.bot;
+
+  const btcEl = document.getElementById('btc-price');
+  const btcCard = document.getElementById('card-btc');
+  if(btc.price > 0){
+    const formatted = '$' + btc.price.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+    flashIfChanged('btc-price', btc.price, btcCard, 'flash-neutral');
+    btcEl.textContent = formatted;
+  } else {
+    btcEl.textContent = '—';
+  }
+
+  const ageEl = document.getElementById('btc-age');
+  if(btc.age_seconds >= 0){
+    ageEl.textContent = btc.age_seconds < 2 ? 'Just now' : `${Math.floor(btc.age_seconds)}s ago`;
+  }
+
+  const srcEl = document.getElementById('btc-sources');
+  srcEl.innerHTML = '';
+  for(const [name, price] of Object.entries(btc.sources || {})){
+    srcEl.innerHTML += `<span class="source-chip"><strong>${name}</strong> $${price.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}</span>`;
+  }
+
+  const pnlEl = document.getElementById('total-pnl');
+  const pnlCard = document.getElementById('card-pnl');
+  const pnlStr = '$' + fmt$(stats.total_pnl);
+  flashIfChanged('total-pnl', stats.total_pnl, pnlCard, stats.total_pnl >= 0 ? 'flash-green' : 'flash-red');
+  pnlEl.textContent = pnlStr;
+  pnlEl.className = 'card-value ' + (stats.total_pnl >= 0 ? 'green' : 'red');
+
+  document.getElementById('daily-pnl').textContent = 'Daily: $' + fmt$(stats.daily_pnl);
+
+  const wr = stats.win_rate * 100;
+  document.getElementById('win-rate').textContent = wr.toFixed(1) + '%';
+  document.getElementById('wr-bar').style.width = wr + '%';
+  document.getElementById('win-loss').textContent = `${stats.wins}W / ${stats.losses}L`;
+
+  document.getElementById('trade-count').textContent = bot.trade_count;
+  document.getElementById('trade-limit').textContent = bot.max_trades > 0 ? `of ${bot.max_trades}` : 'of ∞';
+
+  const riskEl = document.getElementById('risk-status');
+  const clEl = document.getElementById('consec-losses');
+  if(stats.paused){
+    riskEl.textContent = 'PAUSED';
+    riskEl.className = 'card-value red';
+    clEl.textContent = stats.pause_reason || 'Unknown';
+  } else {
+    riskEl.textContent = 'OK';
+    riskEl.className = 'card-value green';
+    clEl.textContent = `Consec. losses: ${stats.consecutive_losses}`;
+  }
+}
+
+/* ── Rounds ──────────────────────────────────────── */
+function updateRounds(data){
+  const tbody = document.getElementById('rounds-body');
+  const rounds = data.rounds || [];
+  roundEndTimestamps = [];
+
+  if(!rounds.length){
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">No active rounds</td></tr>';
     return;
   }
 
-  const ys=pnlHistory.map(p=>p.y);
-  const minY=Math.min(0,...ys);
-  const maxY=Math.max(0,...ys);
-  const rangeY=(maxY-minY)||1;
-  const pad={t:16,b:24,l:48,r:16};
-  const cW=W-pad.l-pad.r, cH=H-pad.t-pad.b;
+  let html = '';
+  rounds.forEach((r, i) => {
+    const cdId = `cd-${i}`;
+    const progId = `cdp-${i}`;
+    const statusId = `st-${i}`;
+    const rem = r.end_timestamp - Date.now() / 1000;
+    const remDisp = rem > 0 ? fmtTime(rem) : '0s';
+    const cdClass = rem <= 10 ? 'urgent' : rem <= 60 ? 'soon' : 'normal';
 
-  const toX=(i)=>pad.l+(i/(pnlHistory.length-1))*cW;
-  const toY=(v)=>pad.t+cH-(((v-minY)/rangeY)*cH);
+    const totalDuration = 300;
+    const pct = Math.max(0, Math.min(100, (rem / totalDuration) * 100));
+    let barColor = 'var(--blue)';
+    if(rem <= 10) barColor = 'var(--red)';
+    else if(rem <= 60) barColor = 'var(--amber)';
 
-  // zero line
-  const zeroY=toY(0);
-  ctx.strokeStyle='#334155';
-  ctx.lineWidth=1;
-  ctx.setLineDash([4,4]);
-  ctx.beginPath();ctx.moveTo(pad.l,zeroY);ctx.lineTo(W-pad.r,zeroY);ctx.stroke();
+    let status;
+    if(rem <= 5) status = '<span class="tag tag-down">CLOSING</span>';
+    else if(rem <= 60) status = '<span class="tag tag-up">ENTRY</span>';
+    else status = '<span style="color:var(--text-dim)">Waiting</span>';
+
+    roundEndTimestamps.push({ elId: cdId, progId, statusId, endTs: r.end_timestamp });
+
+    html += `<tr>
+      <td title="${r.condition_id}">${r.slug || r.condition_id}</td>
+      <td>
+        <span class="countdown ${cdClass}" id="${cdId}">${remDisp}</span>
+        <div class="round-progress"><div class="round-progress-fill" id="${progId}" style="width:${pct}%;background:${barColor}"></div></div>
+      </td>
+      <td>$${(r.up_price || 0).toFixed(3)}</td>
+      <td>$${(r.down_price || 0).toFixed(3)}</td>
+      <td id="${statusId}">${status}</td>
+    </tr>`;
+  });
+  tbody.innerHTML = html;
+}
+
+/* ── Trades ──────────────────────────────────────── */
+function updateTrades(data){
+  const tbody = document.getElementById('trades-body');
+  const trades = (data.trades || []).slice().reverse();
+
+  if(!trades.length){
+    tbody.innerHTML = '<tr><td colspan="8" class="empty">No trades yet</td></tr>';
+    prevTradeCount = 0;
+    return;
+  }
+
+  const isNew = trades.length > prevTradeCount;
+  prevTradeCount = trades.length;
+
+  let html = '';
+  trades.forEach((t, i) => {
+    const dirTag = t.direction === 'up' ? '<span class="tag tag-up">UP</span>' : '<span class="tag tag-down">DN</span>';
+    const resTag = t.won ? '<span class="tag tag-win">WIN</span>' : '<span class="tag tag-loss">LOSS</span>';
+    const pnlColor = t.pnl >= 0 ? 'var(--green)' : 'var(--red)';
+    const newClass = (isNew && i === 0) ? ' class="flash-neutral"' : '';
+    html += `<tr${newClass}>
+      <td>${fmtTimestamp(t.timestamp)}</td>
+      <td>${dirTag}</td>
+      <td>$${t.price.toFixed(3)}</td>
+      <td>${t.size.toFixed(2)}</td>
+      <td>${(t.edge * 100).toFixed(1)}%</td>
+      <td>${(t.confidence * 100).toFixed(0)}%</td>
+      <td style="color:${pnlColor}">$${fmt$(t.pnl)}</td>
+      <td>${resTag}</td>
+    </tr>`;
+  });
+  tbody.innerHTML = html;
+}
+
+/* ── Log ─────────────────────────────────────────── */
+function updateLog(data){
+  const panel = document.getElementById('log-panel');
+  const logs = data.logs || [];
+  if(!logs.length){
+    panel.innerHTML = '<div class="empty">Waiting for log output...</div>';
+    prevLogCount = 0;
+    return;
+  }
+
+  const atBottom = panel.scrollHeight - panel.scrollTop - panel.clientHeight < 40;
+  const newCount = logs.length - prevLogCount;
+  prevLogCount = logs.length;
+
+  let html = '';
+  logs.forEach((l, i) => {
+    const isNew = i >= logs.length - newCount && newCount > 0;
+    html += `<div class="log-line${isNew ? ' log-new' : ''}"><span class="log-ts">${fmtTimestamp(l.ts)}</span><span class="log-lvl ${l.level}">${l.level}</span><span>${escHtml(l.msg)}</span></div>`;
+  });
+  panel.innerHTML = html;
+  if(atBottom) panel.scrollTop = panel.scrollHeight;
+}
+
+/* ── Mini PnL chart (pure canvas, no deps) ─────── */
+let pnlHistory = [];
+function drawPnlChart(data){
+  const trades = data.trades || [];
+  if(!trades.length) return;
+
+  let cumPnl = 0;
+  pnlHistory = [];
+  for(const t of trades){
+    cumPnl += t.pnl;
+    pnlHistory.push({x: t.timestamp, y: cumPnl, won: t.won});
+  }
+
+  const canvas = document.getElementById('pnl-chart');
+  const rect = canvas.parentElement.getBoundingClientRect();
+  canvas.width = rect.width * 2;
+  canvas.height = rect.height * 2;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(2, 2);
+  const W = rect.width, H = rect.height;
+
+  ctx.clearRect(0, 0, W, H);
+
+  if(pnlHistory.length < 2){
+    ctx.fillStyle = '#475569';
+    ctx.font = '12px Inter, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Need 2+ trades to draw chart', W / 2, H / 2);
+    return;
+  }
+
+  const ys = pnlHistory.map(p => p.y);
+  const minY = Math.min(0, ...ys);
+  const maxY = Math.max(0, ...ys);
+  const rangeY = (maxY - minY) || 1;
+  const pad = {t: 16, b: 24, l: 48, r: 16};
+  const cW = W - pad.l - pad.r, cH = H - pad.t - pad.b;
+
+  const toX = (i) => pad.l + (i / (pnlHistory.length - 1)) * cW;
+  const toY = (v) => pad.t + cH - (((v - minY) / rangeY) * cH);
+
+  ctx.strokeStyle = '#334155';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  ctx.moveTo(pad.l, toY(0));
+  ctx.lineTo(W - pad.r, toY(0));
+  ctx.stroke();
   ctx.setLineDash([]);
 
-  // zero label
-  ctx.fillStyle='#64748b';
-  ctx.font='10px JetBrains Mono, monospace';
-  ctx.textAlign='right';
-  ctx.fillText('$0',pad.l-6,zeroY+3);
+  ctx.fillStyle = '#64748b';
+  ctx.font = '10px JetBrains Mono, monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText('$0', pad.l - 6, toY(0) + 3);
 
-  // gradient fill
-  const grad=ctx.createLinearGradient(0,pad.t,0,H-pad.b);
-  const lastVal=pnlHistory[pnlHistory.length-1].y;
-  if(lastVal>=0){
-    grad.addColorStop(0,'rgba(34,197,94,.18)');
-    grad.addColorStop(1,'rgba(34,197,94,0)');
+  const grad = ctx.createLinearGradient(0, pad.t, 0, H - pad.b);
+  const lastVal = pnlHistory[pnlHistory.length - 1].y;
+  if(lastVal >= 0){
+    grad.addColorStop(0, 'rgba(34,197,94,.18)');
+    grad.addColorStop(1, 'rgba(34,197,94,0)');
   } else {
-    grad.addColorStop(0,'rgba(239,68,68,0)');
-    grad.addColorStop(1,'rgba(239,68,68,.18)');
+    grad.addColorStop(0, 'rgba(239,68,68,0)');
+    grad.addColorStop(1, 'rgba(239,68,68,.18)');
   }
 
   ctx.beginPath();
-  ctx.moveTo(toX(0),toY(0));
-  for(let i=0;i<pnlHistory.length;i++) ctx.lineTo(toX(i),toY(pnlHistory[i].y));
-  ctx.lineTo(toX(pnlHistory.length-1),toY(0));
+  ctx.moveTo(toX(0), toY(0));
+  for(let i = 0; i < pnlHistory.length; i++) ctx.lineTo(toX(i), toY(pnlHistory[i].y));
+  ctx.lineTo(toX(pnlHistory.length - 1), toY(0));
   ctx.closePath();
-  ctx.fillStyle=grad;
+  ctx.fillStyle = grad;
   ctx.fill();
 
-  // line
   ctx.beginPath();
-  for(let i=0;i<pnlHistory.length;i++){
-    const x=toX(i),y=toY(pnlHistory[i].y);
-    i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+  for(let i = 0; i < pnlHistory.length; i++){
+    const x = toX(i), y = toY(pnlHistory[i].y);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
   }
-  ctx.strokeStyle=lastVal>=0?'#22c55e':'#ef4444';
-  ctx.lineWidth=2;
-  ctx.lineJoin='round';
+  ctx.strokeStyle = lastVal >= 0 ? '#22c55e' : '#ef4444';
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
   ctx.stroke();
 
-  // dots
-  for(let i=0;i<pnlHistory.length;i++){
-    const p=pnlHistory[i];
+  for(let i = 0; i < pnlHistory.length; i++){
+    const p = pnlHistory[i];
     ctx.beginPath();
-    ctx.arc(toX(i),toY(p.y),3,0,Math.PI*2);
-    ctx.fillStyle=p.won?'#22c55e':'#ef4444';
+    ctx.arc(toX(i), toY(p.y), 3, 0, Math.PI * 2);
+    ctx.fillStyle = p.won ? '#22c55e' : '#ef4444';
     ctx.fill();
   }
 
-  // current value label
-  const lx=toX(pnlHistory.length-1), ly=toY(lastVal);
-  ctx.fillStyle=lastVal>=0?'#22c55e':'#ef4444';
-  ctx.font='bold 11px JetBrains Mono, monospace';
-  ctx.textAlign='left';
-  ctx.fillText('$'+fmt$(lastVal),lx+6,ly+4);
+  const lx = toX(pnlHistory.length - 1), ly = toY(lastVal);
+  ctx.fillStyle = lastVal >= 0 ? '#22c55e' : '#ef4444';
+  ctx.font = 'bold 11px JetBrains Mono, monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText('$' + fmt$(lastVal), lx + 6, ly + 4);
 
-  // Y axis labels
-  ctx.fillStyle='#64748b';
-  ctx.font='10px JetBrains Mono, monospace';
-  ctx.textAlign='right';
-  ctx.fillText('$'+fmt$(maxY,2),pad.l-6,pad.t+10);
-  ctx.fillText('$'+fmt$(minY,2),pad.l-6,H-pad.b-2);
+  ctx.fillStyle = '#64748b';
+  ctx.font = '10px JetBrains Mono, monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText('$' + fmt$(maxY, 2), pad.l - 6, pad.t + 10);
+  ctx.fillText('$' + fmt$(minY, 2), pad.l - 6, H - pad.b - 2);
 }
 
-/* ── Poll loop ──────────────────────────────────── */
-async function poll(){
-  try{
-    const r=await fetch(API);
+/* ── Fallback: HTTP poll if WS unavailable ─────── */
+async function fallbackPoll(){
+  try {
+    const r = await fetch('/api/state');
     if(!r.ok) return;
-    const data=await r.json();
-    updateHeader(data);
-    updateCards(data);
-    updateRounds(data);
-    updateTrades(data);
-    updateLog(data);
-    drawPnlChart(data);
-  }catch(e){
-    console.warn('Poll failed:',e);
+    const data = await r.json();
+    lastData = data;
+    onData(data);
+  } catch(e) {
+    console.warn('Fallback poll failed:', e);
   }
 }
 
-setInterval(poll, POLL_MS);
-poll();
+/* ── Boot ─────────────────────────────────────────── */
+startTick();
+connectWS();
+
+setTimeout(() => {
+  if(!lastData) fallbackPoll();
+}, 3000);
 </script>
 </body>
 </html>

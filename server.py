@@ -1,16 +1,18 @@
 """
 Web server + bot runner for Railway deployment.
 Runs the trading bot in a background thread and serves
-a real-time dashboard via FastAPI.
+a real-time dashboard via FastAPI with WebSocket live updates.
 """
 
+import asyncio
+import json
 import logging
 import os
 import threading
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from src.bot_state import state as dashboard
@@ -23,6 +25,7 @@ logging.basicConfig(
 log = logging.getLogger("server")
 
 _bot_thread: threading.Thread | None = None
+_ws_clients: set[WebSocket] = set()
 
 
 def _run_bot():
@@ -37,6 +40,21 @@ def _run_bot():
         dashboard.update_bot_status(False, 0, 0, 0, "CRASHED")
 
 
+async def _broadcast_loop():
+    """Push state snapshots to all connected WebSocket clients every second."""
+    while True:
+        if _ws_clients:
+            payload = json.dumps(dashboard.snapshot())
+            stale = set()
+            for ws in _ws_clients.copy():
+                try:
+                    await ws.send_text(payload)
+                except Exception:
+                    stale.add(ws)
+            _ws_clients.difference_update(stale)
+        await asyncio.sleep(1)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _bot_thread
@@ -44,7 +62,9 @@ async def lifespan(app: FastAPI):
     _bot_thread = threading.Thread(target=_run_bot, daemon=True, name="bot-main")
     _bot_thread.start()
     log.info("Bot thread started. Dashboard available at /")
+    broadcast_task = asyncio.create_task(_broadcast_loop())
     yield
+    broadcast_task.cancel()
     log.info("Shutting down...")
 
 
@@ -56,6 +76,21 @@ async def root():
     html_path = os.path.join(os.path.dirname(__file__), "templates", "dashboard.html")
     with open(html_path, "r", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
+
+
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    _ws_clients.add(ws)
+    log.info("WebSocket client connected (%d total)", len(_ws_clients))
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        _ws_clients.discard(ws)
+        log.info("WebSocket client disconnected (%d remaining)", len(_ws_clients))
 
 
 @app.get("/api/state")
