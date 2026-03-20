@@ -44,9 +44,9 @@ MIN_CONTRACT_PRICE: float = _float("MIN_CONTRACT_PRICE", 0.35)
 MAX_CONTRACT_PRICE: float = _float("MAX_CONTRACT_PRICE", 0.95)
 LIVE_TRADING: bool = _bool("LIVE_TRADING", False)
 
-# ── Kelly / Bankroll parameters (UNRESTRICTED — max growth) ──
+# ── Kelly / Bankroll parameters ───────────────────────────────
 STARTING_BANKROLL: float = _float("STARTING_BANKROLL", 250.0)
-KELLY_MULTIPLIER: float = _float("KELLY_MULTIPLIER", 1.0)
+KELLY_MULTIPLIER: float = _float("KELLY_MULTIPLIER", 0.25)
 MIN_BET_DOLLARS: float = _float("MIN_BET_DOLLARS", 0.50)
 VOLATILITY_LOOKBACK: int = _int("VOLATILITY_LOOKBACK", 20)
 CONFIDENCE_FLOOR: float = _float("CONFIDENCE_FLOOR", 0.55)

@@ -3,25 +3,28 @@ Polymarket BTC 5-Minute Oracle-Verified Trading Bot
 ====================================================
 Main entry point.  Runs a continuous loop that:
   1. Discovers active BTC 5-min up/down rounds on Polymarket.
-  2. For each round approaching expiry, captures the opening BTC price.
-  3. In the final seconds, compares real BTC price (Chainlink + CEX) to
-     the opening price to determine likely direction.
+  2. Captures the opening BTC price for each round (from market
+     description first, then Chainlink as close to round start
+     as possible).
+  3. In the final minutes, compares real BTC price (Chainlink + CEX)
+     to the opening price to determine likely direction.
   4. If the CLOB contract price offers sufficient edge, places a
-     Fill-or-Kill BUY order on the likely-winning outcome.
-  5. Tracks results and enforces risk limits (daily loss cap,
-     consecutive-loss pause, emergency shutdown).
+     Fill-And-Kill BUY order on the likely-winning outcome.
+  5. After the round ends, checks the ACTUAL resolution from
+     Polymarket's Gamma API (or Chainlink fallback) — no random
+     simulation — and updates bankroll from real outcomes.
 
 DISCLAIMER: This software is for educational and research purposes only.
 It is NOT financial advice.  Algorithmic trading carries substantial risk
-of loss.  Over 90% of back-tested strategies fail in live markets.
-Always consult a qualified financial advisor before risking real capital.
+of loss.  Always consult a qualified financial advisor before risking
+real capital.
 """
 
 import logging
-import random
 import signal
 import sys
 import time
+from dataclasses import dataclass, field
 
 from src.config import (
     LIVE_TRADING,
@@ -30,11 +33,16 @@ from src.config import (
     MIN_EDGE,
     KELLY_MULTIPLIER,
 )
-from src.market_reader import discover_active_btc_5m_markets, MarketRound
+from src.market_reader import (
+    discover_active_btc_5m_markets,
+    MarketRound,
+    check_round_resolution,
+    extract_reference_price,
+)
 from src.price_oracle import get_btc_price
 from src.strategy import evaluate_round, get_bankroll, record_bet_result
 from src.risk_manager import RiskManager
-from src.trader import place_buy_order
+from src.trader import place_buy_order, FillResult
 from src.fees import effective_fee_rate
 from src.bot_state import state as dashboard, TradeEntry, install_log_handler
 
@@ -54,6 +62,10 @@ risk = RiskManager()
 
 _shutdown = False
 
+RESOLUTION_WAIT_SECONDS = 20
+RESOLUTION_TIMEOUT_SECONDS = 600
+OPENING_PRICE_MAX_AGE = 30
+
 
 def _handle_signal(signum, frame):
     global _shutdown
@@ -67,29 +79,53 @@ if _threading.current_thread() is _threading.main_thread():
     signal.signal(signal.SIGTERM, _handle_signal)
 
 
+@dataclass
+class PendingTrade:
+    """A trade waiting for its round to resolve."""
+    condition_id: str
+    event_slug: str
+    direction: str
+    action: str
+    token_id: str
+    entry_price: float
+    filled_size: float
+    bet_dollars: float
+    edge: float
+    confidence: float
+    kelly_fraction: float
+    fee_rate_pct: float
+    effective_price: float
+    btc_opening: float
+    btc_at_entry: float
+    entry_time: float
+    round_end_timestamp: int
+    is_live: bool
+    resolution_attempts: int = 0
+
+
 def print_banner():
-    mode = "LIVE" if LIVE_TRADING else "DRY RUN (paper)"
+    mode = "LIVE" if LIVE_TRADING else "DRY RUN (paper — real resolution)"
     br = get_bankroll()
     print()
     print("=" * 62)
-    print("   Polymarket BTC 5-Min UNRESTRICTED Kelly Bot")
+    print("   Polymarket BTC 5-Min Oracle-Verified Bot")
     print("=" * 62)
     print(f"   Mode:                {mode}")
     print(f"   Bankroll:            ${br.current_balance:.2f} (started ${br.starting_balance:.2f})")
-    print(f"   Kelly multiplier:    {KELLY_MULTIPLIER:.0%} Kelly (FULL)")
-    print(f"   Bet sizing:          UNRESTRICTED (Kelly decides)")
-    print(f"   Profit reinvestment: 100% (max compounding)")
-    print(f"   Trade limits:        NONE (runs forever)")
+    print(f"   Kelly multiplier:    {KELLY_MULTIPLIER:.0%} Kelly (quarter)")
+    print(f"   Bet sizing:          Kelly-optimal (capped at {KELLY_MULTIPLIER:.0%})")
+    print(f"   Profit reinvestment: 100% (compounding)")
     print(f"   Min edge threshold:  {MIN_EDGE*100:.1f}% (after Polymarket fees)")
     print(f"   Crypto fee at 50c:   ~1.56% (auto-fetched per token)")
     print(f"   Entry window:        {ENTRY_WINDOW_START}s -> {ENTRY_WINDOW_END}s before close")
+    print(f"   Resolution:          REAL (Polymarket Gamma API + Chainlink)")
     if br.num_bets > 0:
         print(f"   Lifetime bets:       {br.num_bets} ({br.win_rate*100:.1f}% win rate)")
         print(f"   Lifetime P&L:        ${br.total_profit:+.2f} ({br.roi*100:+.1f}% ROI)")
         print(f"   Current drawdown:    {br.drawdown*100:.1f}%")
     print("=" * 62)
     if not LIVE_TRADING:
-        print("   *** DRY RUN - no real orders will be placed ***")
+        print("   *** DRY RUN — orders are simulated but outcomes are REAL ***")
         print("   Set LIVE_TRADING=true in .env to go live.")
         print("=" * 62)
     print()
@@ -119,8 +155,10 @@ class RoundTracker:
     def get_opening_price(self, condition_id: str) -> float | None:
         return self._opening_prices.get(condition_id)
 
-    def cleanup(self, active_ids: set[str]):
-        stale = [k for k in self._opening_prices if k not in active_ids]
+    def cleanup(self, active_ids: set[str], pending_ids: set[str]):
+        """Remove stale entries, but keep any that have pending trades."""
+        keep = active_ids | pending_ids
+        stale = [k for k in self._opening_prices if k not in keep]
         for k in stale:
             del self._opening_prices[k]
             self._traded.discard(k)
@@ -128,6 +166,7 @@ class RoundTracker:
 
 def main_loop():
     tracker = RoundTracker()
+    pending_trades: list[PendingTrade] = []
     cycle = 0
     trade_count = 0
 
@@ -141,15 +180,22 @@ def main_loop():
         risk.pre_trade_check()
         dashboard.update_risk_stats(risk.stats_summary())
 
-        log.info("-- Cycle %d  [trades: %d] -------------------------",
-                 cycle, trade_count)
+        log.info(
+            "-- Cycle %d  [trades: %d | pending: %d] -------------------------",
+            cycle, trade_count, len(pending_trades),
+        )
 
+        # ── Phase 1: resolve pending trades whose rounds have ended ──
+        _resolve_pending_trades(pending_trades, tracker)
+
+        # ── Phase 2: fetch current BTC price ──
         try:
             oracle = get_btc_price()
             dashboard.update_btc_price(oracle)
         except Exception:
             pass
 
+        # ── Phase 3: discover active rounds ──
         try:
             rounds = discover_active_btc_5m_markets()
         except Exception as e:
@@ -164,21 +210,22 @@ def main_loop():
 
         dashboard.update_rounds(rounds)
         active_ids = {r.condition_id for r in rounds}
-        tracker.cleanup(active_ids)
+        pending_ids = {p.condition_id for p in pending_trades}
+        tracker.cleanup(active_ids, pending_ids)
 
         log.info("Found %d active round(s)", len(rounds))
 
+        # ── Phase 4: capture opening prices & trade eligible rounds ──
         for rnd in rounds:
             if _shutdown:
                 break
-
-            remaining = rnd.seconds_remaining
 
             _capture_opening_price(tracker, rnd)
 
             if tracker.already_traded(rnd.condition_id):
                 continue
 
+            remaining = rnd.seconds_remaining
             if remaining > ENTRY_WINDOW_START or remaining < ENTRY_WINDOW_END:
                 continue
 
@@ -190,8 +237,8 @@ def main_loop():
                 opening or 0,
             )
 
-            signal = evaluate_round(rnd, opening)
-            if signal is None:
+            sig = evaluate_round(rnd, opening)
+            if sig is None:
                 log.info("  -> No signal (edge/confidence/price insufficient)")
                 continue
 
@@ -199,96 +246,264 @@ def main_loop():
                 ">>> EXECUTING: %s on %s | P(win)=%.3f edge=%.4f (fee-adj) | "
                 "price=$%.3f eff=$%.3f fee=%.2f%% | "
                 "Kelly=%.4f -> $%.2f (%.1f contracts @ $%.3f) | EV=$%.4f",
-                signal.action, rnd.condition_id[:12],
-                signal.confidence, signal.edge,
-                signal.price, signal.effective_price, signal.fee_rate_pct,
-                signal.kelly_fraction, signal.bet_dollars,
-                signal.size, signal.price, signal.expected_profit,
+                sig.action, rnd.condition_id[:12],
+                sig.confidence, sig.edge,
+                sig.price, sig.effective_price, sig.fee_rate_pct,
+                sig.kelly_fraction, sig.bet_dollars,
+                sig.size, sig.price, sig.expected_profit,
             )
 
-            result = place_buy_order(
-                token_id=signal.token_id,
-                price=signal.price,
-                size=signal.size,
-                neg_risk=signal.neg_risk,
-                tick_size=signal.tick_size,
+            fill = place_buy_order(
+                token_id=sig.token_id,
+                price=sig.price,
+                size=sig.size,
+                neg_risk=sig.neg_risk,
+                tick_size=sig.tick_size,
                 order_type="FAK",
-                min_order_size=signal.min_order_size,
+                min_order_size=sig.min_order_size,
             )
 
-            if result:
+            if fill.success:
                 tracker.mark_traded(rnd.condition_id)
                 trade_count += 1
 
-                pnl, won = _estimate_pnl(signal)
+                # bet_dollars = raw USDC paid (contracts * price).
+                # The fee is taken in shares (fewer shares received),
+                # NOT as extra USDC cost. Accounted for in _record_resolution
+                # by reducing effective_contracts.
+                actual_bet = fill.filled_size * fill.avg_price
 
-                if won:
-                    record_bet_result(True, signal.bet_dollars, signal.size * 1.0)
-                else:
-                    record_bet_result(False, signal.bet_dollars)
-
-                risk.record_pnl(
-                    won=won, pnl=pnl, direction=signal.direction,
-                    bet_dollars=signal.bet_dollars,
-                    kelly_fraction=signal.kelly_fraction,
-                    win_prob=signal.confidence,
+                pending = PendingTrade(
+                    condition_id=rnd.condition_id,
+                    event_slug=rnd.event_slug,
+                    direction=sig.direction,
+                    action=sig.action,
+                    token_id=sig.token_id,
+                    entry_price=fill.avg_price,
+                    filled_size=fill.filled_size,
+                    bet_dollars=actual_bet,
+                    edge=sig.edge,
+                    confidence=sig.confidence,
+                    kelly_fraction=sig.kelly_fraction,
+                    fee_rate_pct=sig.fee_rate_pct,
+                    effective_price=sig.effective_price,
+                    btc_opening=sig.btc_opening,
+                    btc_at_entry=sig.btc_current,
+                    entry_time=time.time(),
+                    round_end_timestamp=rnd.end_timestamp,
+                    is_live=fill.is_live,
                 )
+                pending_trades.append(pending)
 
-                br = get_bankroll()
                 dashboard.add_trade(TradeEntry(
                     timestamp=time.time(),
-                    direction=signal.direction,
-                    action=signal.action,
-                    price=signal.price,
-                    size=signal.size,
-                    edge=signal.edge,
-                    confidence=signal.confidence,
-                    pnl=pnl,
-                    won=won,
-                    btc_price=signal.btc_current,
+                    direction=sig.direction,
+                    action=sig.action,
+                    price=fill.avg_price,
+                    size=fill.filled_size,
+                    edge=sig.edge,
+                    confidence=sig.confidence,
+                    pnl=0.0,
+                    won=False,
+                    btc_price=sig.btc_current,
                     condition_id=rnd.condition_id[:16],
-                    reason=signal.reason,
+                    reason=sig.reason,
+                    status="pending",
                 ))
-                dashboard.update_risk_stats(risk.stats_summary())
+
+                if fill.filled_size < fill.requested_size:
+                    log.warning(
+                        "Partial fill: %.1f / %.1f contracts (%.0f%%)",
+                        fill.filled_size, fill.requested_size,
+                        fill.filled_size / fill.requested_size * 100,
+                    )
+
                 dashboard.add_log(
                     "INFO",
-                    f"Trade #{trade_count}: {signal.action} "
-                    f"edge={signal.edge:.4f} kelly={signal.kelly_fraction:.4f} "
-                    f"bet=${signal.bet_dollars:.2f} pnl=${pnl:.4f} "
-                    f"bankroll=${br.current_balance:.2f}",
+                    f"Trade #{trade_count}: {sig.action} "
+                    f"edge={sig.edge:.4f} kelly={sig.kelly_fraction:.4f} "
+                    f"filled={fill.filled_size:.1f}/{fill.requested_size:.1f} "
+                    f"@ ${fill.avg_price:.3f} -> PENDING resolution",
+                )
+            else:
+                log.warning(
+                    "Order failed: %s (size=%.1f @ $%.3f)",
+                    fill.status, fill.requested_size, sig.price,
                 )
 
-                log.info(
-                    "Trade #%d | PnL=$%.4f | Bankroll=$%.2f | "
-                    "Drawdown=%.1f%% | Total PnL=$%.4f",
-                    trade_count, pnl,
-                    br.current_balance, br.drawdown * 100,
-                    risk.total_pnl(),
-                )
-
-        _print_status(cycle, rounds)
+        _print_status(cycle, rounds, pending_trades)
         dashboard.update_risk_stats(risk.stats_summary())
 
-        sleep_time = _calculate_sleep(rounds)
+        sleep_time = _calculate_sleep(rounds, pending_trades)
         log.debug("Sleeping %.1fs until next check", sleep_time)
         _sleep(sleep_time)
 
+    # ── Shutdown: try to resolve remaining trades ──
+    if pending_trades:
+        log.info("Resolving %d pending trades before shutdown...", len(pending_trades))
+        for _ in range(30):
+            _resolve_pending_trades(pending_trades, tracker)
+            if not pending_trades:
+                break
+            _sleep(2)
+
     dashboard.update_bot_status(False, cycle, trade_count, 0, mode)
     log.info("Bot shut down gracefully.")
-    _print_final_stats()
+    _print_final_stats(pending_trades)
 
+
+# ── Resolution ────────────────────────────────────────────────
+
+def _resolve_pending_trades(
+    pending_trades: list[PendingTrade],
+    tracker: RoundTracker,
+):
+    """
+    Check each pending trade for resolution.
+
+    Primary: Polymarket Gamma API (check_round_resolution) — gives the
+    authoritative on-chain result.
+    Fallback: If the Gamma API doesn't show resolution yet but the round
+    ended >60s ago, use Chainlink price vs opening price.
+    """
+    if not pending_trades:
+        return
+
+    now = time.time()
+    resolved: list[PendingTrade] = []
+
+    for trade in pending_trades:
+        if now < trade.round_end_timestamp + RESOLUTION_WAIT_SECONDS:
+            continue
+
+        trade.resolution_attempts += 1
+
+        outcome = check_round_resolution(trade.event_slug)
+
+        if outcome is None and now > trade.round_end_timestamp + 300:
+            log.warning(
+                "Gamma API not resolving %s after 5min — trying Chainlink fallback "
+                "(UNRELIABLE: compares current price, not close price)",
+                trade.condition_id[:12],
+            )
+            outcome = _chainlink_fallback_resolution(trade)
+
+        if outcome is None:
+            if now > trade.round_end_timestamp + RESOLUTION_TIMEOUT_SECONDS:
+                log.warning(
+                    "Resolution timeout for %s after %d attempts — "
+                    "marking as unresolved loss",
+                    trade.condition_id[:12], trade.resolution_attempts,
+                )
+                _record_resolution(trade, won=False, outcome="timeout")
+                resolved.append(trade)
+            else:
+                if trade.resolution_attempts <= 3 or trade.resolution_attempts % 10 == 0:
+                    log.info(
+                        "Waiting for resolution: %s (attempt %d, %.0fs since end)",
+                        trade.condition_id[:12],
+                        trade.resolution_attempts,
+                        now - trade.round_end_timestamp,
+                    )
+            continue
+
+        won = outcome == trade.direction
+        _record_resolution(trade, won=won, outcome=outcome)
+        resolved.append(trade)
+
+    for trade in resolved:
+        pending_trades.remove(trade)
+
+
+def _chainlink_fallback_resolution(trade: PendingTrade) -> str | None:
+    """
+    If the Gamma API hasn't reported resolution, compare the current
+    Chainlink price to the opening price as a fallback.
+    """
+    try:
+        oracle = get_btc_price()
+        chainlink = oracle.get("chainlink")
+        if chainlink is None:
+            chainlink = oracle.get("median")
+        if chainlink is None or trade.btc_opening <= 0:
+            return None
+
+        if chainlink > trade.btc_opening:
+            return "up"
+        elif chainlink < trade.btc_opening:
+            return "down"
+        return None
+    except Exception:
+        return None
+
+
+def _record_resolution(trade: PendingTrade, won: bool, outcome: str):
+    """Update bankroll, risk manager, and dashboard with the actual result."""
+    fee_rate = effective_fee_rate(trade.entry_price)
+    effective_contracts = trade.filled_size * (1.0 - fee_rate)
+
+    if won:
+        payout = effective_contracts * 1.0
+        pnl = payout - trade.bet_dollars
+    else:
+        pnl = -trade.bet_dollars
+
+    if won:
+        record_bet_result(True, trade.bet_dollars, payout)
+    else:
+        record_bet_result(False, trade.bet_dollars)
+
+    risk.record_pnl(
+        won=won, pnl=pnl, direction=trade.direction,
+        bet_dollars=trade.bet_dollars,
+        kelly_fraction=trade.kelly_fraction,
+        win_prob=trade.confidence,
+    )
+
+    br = get_bankroll()
+
+    dashboard.resolve_trade(trade.condition_id[:16], won=won, pnl=pnl)
+    dashboard.update_risk_stats(risk.stats_summary())
+
+    result_str = "WIN" if won else "LOSS"
+    source = "Gamma API" if outcome in ("up", "down") else f"fallback ({outcome})"
+    log.info(
+        "RESOLVED %s: %s %s | outcome=%s (via %s) | "
+        "PnL=$%.4f | Bankroll=$%.2f | Drawdown=%.1f%%",
+        trade.condition_id[:12], result_str, trade.action,
+        outcome, source, pnl, br.current_balance, br.drawdown * 100,
+    )
+    dashboard.add_log(
+        "INFO",
+        f"RESOLVED: {trade.action} -> {result_str} (actual={outcome}) "
+        f"pnl=${pnl:.4f} bankroll=${br.current_balance:.2f}",
+    )
+
+
+# ── Opening price capture ─────────────────────────────────────
 
 def _capture_opening_price(tracker: RoundTracker, rnd: MarketRound):
     """
-    Record the BTC price at the start of a round if not already captured.
-    Only captures if the round has actually started and is within
-    the first 30 seconds, to get a price close to the true opening.
+    Record the BTC reference price for this round.
+
+    Priority:
+    1. Extract from market description/question (Polymarket's own ref price)
+    2. Chainlink on-chain price (captured within first 15s of round)
     """
     if tracker.get_opening_price(rnd.condition_id) is not None:
         return
 
+    ref = extract_reference_price(rnd.question) or extract_reference_price(rnd.description)
+    if ref is not None:
+        tracker.set_opening_price(rnd.condition_id, ref)
+        log.info(
+            "Reference price from market text for %s: $%.2f",
+            rnd.condition_id[:12], ref,
+        )
+        return
+
     elapsed = rnd.seconds_elapsed
-    if elapsed < 0 or elapsed > 60:
+    if elapsed < 0 or elapsed > OPENING_PRICE_MAX_AGE:
         return
 
     oracle = get_btc_price()
@@ -298,49 +513,34 @@ def _capture_opening_price(tracker: RoundTracker, rnd: MarketRound):
         tracker.set_opening_price(rnd.condition_id, price)
 
 
-def _estimate_pnl(signal) -> tuple[float, bool]:
-    """
-    In dry-run mode we simulate a REAL binary outcome using the
-    estimated win probability. The bet either wins or loses —
-    no expected-value smoothing — so paper results reflect real variance.
+# ── Sleep / status helpers ────────────────────────────────────
 
-    Accounts for Polymarket crypto fees:
-      - Fee is taken in shares on buy (fewer contracts received)
-      - Effective contracts = size * (1 - effective_fee_rate)
-      - Win payout: effective_contracts * $1.00
-      - Loss: -bet_dollars (USDC already paid)
+def _calculate_sleep(
+    rounds: list[MarketRound],
+    pending_trades: list[PendingTrade],
+) -> float:
+    """Smart sleep: wake up when the nearest round enters our entry window
+    or when a pending trade might be ready for resolution."""
+    min_sleep = 10.0
 
-    For live mode, the actual PnL comes from contract resolution.
-
-    Returns (pnl_dollars, won).
-    """
-    if not LIVE_TRADING:
-        won = random.random() < signal.confidence
-        fee_rate = effective_fee_rate(signal.price)
-        effective_contracts = signal.size * (1.0 - fee_rate)
-
-        if won:
-            payout = effective_contracts * 1.0
-            profit = payout - signal.bet_dollars
-            return profit, True
+    if rounds:
+        nearest = min(r.seconds_remaining for r in rounds)
+        if nearest <= ENTRY_WINDOW_START + 5:
+            min_sleep = min(min_sleep, 1.0)
+        elif nearest <= ENTRY_WINDOW_START + 30:
+            min_sleep = min(min_sleep, 2.0)
         else:
-            return -signal.bet_dollars, False
-    return 0.0, False
+            min_sleep = min(min_sleep, nearest - ENTRY_WINDOW_START - 5)
 
+    if pending_trades:
+        now = time.time()
+        for pt in pending_trades:
+            time_until_check = (pt.round_end_timestamp + RESOLUTION_WAIT_SECONDS) - now
+            if time_until_check <= 0:
+                return 1.0
+            min_sleep = min(min_sleep, time_until_check + 1)
 
-def _calculate_sleep(rounds: list[MarketRound]) -> float:
-    """Smart sleep: wake up when the nearest round enters our entry window."""
-    if not rounds:
-        return 10.0
-
-    nearest = min(r.seconds_remaining for r in rounds)
-
-    if nearest <= ENTRY_WINDOW_START + 5:
-        return 1.0
-    elif nearest <= ENTRY_WINDOW_START + 30:
-        return 2.0
-    else:
-        return min(10.0, nearest - ENTRY_WINDOW_START - 5)
+    return max(1.0, min_sleep)
 
 
 def _sleep(seconds: float):
@@ -350,20 +550,20 @@ def _sleep(seconds: float):
         time.sleep(min(1.0, end - time.time()))
 
 
-def _print_status(cycle: int, rounds: list[MarketRound]):
+def _print_status(cycle: int, rounds: list[MarketRound], pending: list[PendingTrade]):
     if cycle % 10 != 0:
         return
     stats = risk.stats_summary()
     log.info(
         "STATUS | trades=%d  wins=%d  losses=%d  win_rate=%.1f%%  "
-        "daily_pnl=$%.4f  total_pnl=$%.4f  consec_losses=%d",
+        "daily_pnl=$%.4f  total_pnl=$%.4f  pending=%d  consec_losses=%d",
         stats["total_trades"], stats["wins"], stats["losses"],
         stats["win_rate"] * 100, stats["daily_pnl"], stats["total_pnl"],
-        stats["consecutive_losses"],
+        len(pending), stats["consecutive_losses"],
     )
 
 
-def _print_final_stats():
+def _print_final_stats(pending_trades: list[PendingTrade] | None = None):
     stats = risk.stats_summary()
     br = get_bankroll()
     print()
@@ -379,6 +579,8 @@ def _print_final_stats():
     print(f"  Daily PnL:          ${stats['daily_pnl']:.4f}")
     print(f"  Total PnL:          ${stats['total_pnl']:.4f}")
     print(f"  Consecutive losses: {stats['consecutive_losses']}")
+    if pending_trades:
+        print(f"  Unresolved trades:  {len(pending_trades)}")
     print("  " + "-" * 40)
     print(f"  Bankroll:           ${br.current_balance:.2f}")
     print(f"  Starting balance:   ${br.starting_balance:.2f}")
@@ -388,6 +590,7 @@ def _print_final_stats():
     print(f"  Drawdown:           {br.drawdown*100:.1f}%")
     print(f"  Total wagered:      ${br.total_wagered:.2f}")
     print(f"  Fee model:          Polymarket crypto (max 1.56% at 50c)")
+    print(f"  Resolution:         REAL (Gamma API + Chainlink)")
     print("=" * 58)
     print()
 

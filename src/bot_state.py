@@ -23,6 +23,7 @@ class TradeEntry:
     btc_price: float
     condition_id: str
     reason: str
+    status: str = "resolved"  # "pending", "resolved", "failed"
 
 
 class BotState:
@@ -101,6 +102,16 @@ class BotState:
             if len(self.trades) > 500:
                 self.trades = self.trades[-500:]
 
+    def resolve_trade(self, condition_id: str, won: bool, pnl: float):
+        """Update a pending trade to resolved state once the round settles."""
+        with self._lock:
+            for t in reversed(self.trades):
+                if t.condition_id == condition_id and t.status == "pending":
+                    t.won = won
+                    t.pnl = pnl
+                    t.status = "resolved"
+                    return
+
     def update_risk_stats(self, stats: dict):
         with self._lock:
             self.total_pnl = stats.get("total_pnl", 0.0)
@@ -172,6 +183,7 @@ class BotState:
                         "btc_price": t.btc_price,
                         "condition_id": t.condition_id,
                         "reason": t.reason,
+                        "status": t.status,
                     }
                     for t in self.trades[-50:]
                 ],

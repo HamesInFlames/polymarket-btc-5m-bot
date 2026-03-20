@@ -17,6 +17,7 @@ Source: https://docs.polymarket.com/trading/orderbook
 """
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -425,3 +426,97 @@ def get_midpoint_price(token_id: str) -> float:
     """Quick helper — just the midpoint."""
     mid = _fetch_midpoint(token_id)
     return mid if mid else 0.5
+
+
+# ── Resolution & reference-price helpers ──────────────────────
+
+def check_round_resolution(event_slug: str) -> Optional[str]:
+    """
+    Check whether a round has resolved on Polymarket.
+
+    Polymarket's Gamma API does not always set `resolved=True` for
+    BTC 5-min markets.  Instead, we check the `outcomePrices` — when
+    one outcome is 1.0 and the other is 0.0, the market has settled.
+
+    Returns:
+        "up"   – the Up outcome won
+        "down" – the Down outcome won
+        None   – not yet resolved (or fetch failed)
+    """
+    try:
+        resp = requests.get(
+            f"{GAMMA_HOST}/events/slug/{event_slug}",
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            return None
+
+        event = resp.json()
+        markets = event.get("markets", [])
+        if not markets:
+            return None
+
+        market = markets[0]
+
+        outcomes = market.get("outcomes")
+        if isinstance(outcomes, str):
+            import json as _json
+            outcomes = _json.loads(outcomes)
+        if not outcomes:
+            outcomes = ["Up", "Down"]
+
+        outcome_prices = market.get("outcomePrices")
+        if isinstance(outcome_prices, str):
+            import json as _json
+            outcome_prices = _json.loads(outcome_prices)
+
+        if not outcome_prices or len(outcome_prices) < 2:
+            return None
+
+        up_idx = 0
+        down_idx = 1
+        for i, o in enumerate(outcomes):
+            lower = str(o).lower()
+            if "up" in lower:
+                up_idx = i
+            elif "down" in lower:
+                down_idx = i
+
+        try:
+            up_final = float(outcome_prices[up_idx])
+            down_final = float(outcome_prices[down_idx])
+        except (ValueError, IndexError):
+            return None
+
+        if up_final > 0.9:
+            return "up"
+        if down_final > 0.9:
+            return "down"
+
+        return None
+
+    except Exception as e:
+        log.debug("Resolution check failed for %s: %s", event_slug, e)
+        return None
+
+
+def extract_reference_price(text: str) -> Optional[float]:
+    """
+    Try to extract the BTC reference / opening price from a market's
+    question or description text.
+
+    Typical formats:
+        "Will Bitcoin be above $84,234.56 at 14:35 UTC?"
+        "Resolves Up if price > $84234.56"
+    """
+    if not text:
+        return None
+    matches = re.findall(r"\$[\d,]+\.?\d*", text)
+    for match in matches:
+        try:
+            price = float(match.replace("$", "").replace(",", ""))
+            if 1_000 < price < 1_000_000:
+                return price
+        except ValueError:
+            continue
+    return None

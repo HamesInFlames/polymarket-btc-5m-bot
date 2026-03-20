@@ -18,6 +18,7 @@ Source: https://docs.polymarket.com/trading/orders/create
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Optional
 
 from py_clob_client.client import ClobClient
@@ -29,6 +30,19 @@ from src.config import CLOB_HOST, CHAIN_ID, PRIVATE_KEY, LIVE_TRADING
 log = logging.getLogger(__name__)
 
 _client: Optional[ClobClient] = None
+
+
+@dataclass
+class FillResult:
+    """Structured result from an order placement attempt."""
+    success: bool
+    order_id: str
+    status: str
+    requested_size: float
+    filled_size: float
+    avg_price: float
+    is_live: bool
+    raw_response: Optional[dict] = None
 
 
 def get_client() -> ClobClient:
@@ -74,19 +88,16 @@ def place_buy_order(
     tick_size: str = "0.01",
     order_type: str = "FAK",
     min_order_size: float = 5.0,
-) -> Optional[dict]:
+) -> FillResult:
     """
-    Place a BUY order on the Polymarket CLOB.
+    Place a BUY order on the Polymarket CLOB and return structured fill info.
 
     For time-sensitive BTC 5-min rounds, FAK (Fill-And-Kill) is the default:
-    fills whatever liquidity is available, cancels the rest. No stale orders.
+    fills whatever liquidity is available, cancels the rest.
 
-    The py-clob-client SDK automatically handles:
-      - Fetching and including feeRateBps in the signed order
-      - EIP-712 signing
-      - Tick size conformance
-
-    In dry-run mode (LIVE_TRADING=false), logs but does not submit.
+    In dry-run mode (LIVE_TRADING=false), returns a FillResult that assumes
+    the order would have filled at the limit price. The actual outcome is
+    determined later by checking the real market resolution.
     """
     if size < min_order_size:
         log.warning(
@@ -101,17 +112,18 @@ def place_buy_order(
             "type=%s tick=%s neg_risk=%s",
             token_id[:16], price, size, order_type, tick_size, neg_risk,
         )
-        return {
-            "orderID": "dry-run",
-            "status": "SIMULATED",
-            "price": price,
-            "size": size,
-            "order_type": order_type,
-        }
+        return FillResult(
+            success=True,
+            order_id="dry-run",
+            status="SIMULATED",
+            requested_size=size,
+            filled_size=size,
+            avg_price=price,
+            is_live=False,
+        )
 
     try:
         client = get_client()
-
         ot = _parse_order_type(order_type)
 
         resp = client.create_and_post_order(
@@ -127,15 +139,73 @@ def place_buy_order(
             },
             order_type=ot,
         )
-        log.info(
-            "ORDER PLACED: id=%s status=%s type=%s price=$%.3f size=%.1f",
-            resp.get("orderID", "?"), resp.get("status", "?"),
-            order_type, price, size,
-        )
-        return resp
+
+        return _parse_fill_result(resp, requested_size=size, limit_price=price)
+
     except Exception as e:
         log.error("Order placement failed: %s", e)
-        return None
+        return FillResult(
+            success=False,
+            order_id="",
+            status=f"ERROR: {e}",
+            requested_size=size,
+            filled_size=0.0,
+            avg_price=0.0,
+            is_live=True,
+        )
+
+
+def _parse_fill_result(
+    resp: dict, requested_size: float, limit_price: float,
+) -> FillResult:
+    """
+    Parse the CLOB response into a structured FillResult.
+
+    Polymarket CLOB statuses:
+      MATCHED  – fully or partially matched immediately
+      LIVE     – resting on the book (should not happen with FAK)
+      DELAYED  – pending processing
+    """
+    if not resp:
+        return FillResult(
+            success=False, order_id="", status="EMPTY_RESPONSE",
+            requested_size=requested_size, filled_size=0.0,
+            avg_price=0.0, is_live=True,
+        )
+
+    order_id = resp.get("orderID", resp.get("id", "?"))
+    status = resp.get("status", "UNKNOWN")
+
+    filled_size = 0.0
+    avg_price = limit_price
+
+    if status == "MATCHED":
+        filled_size = float(resp.get("size_matched", requested_size))
+        avg_price = float(resp.get("price", limit_price))
+    elif status == "LIVE":
+        filled_size = float(resp.get("size_matched", 0.0))
+        avg_price = float(resp.get("price", limit_price))
+    else:
+        filled_size = float(resp.get("size_matched", 0.0))
+        avg_price = float(resp.get("price", limit_price))
+
+    success = filled_size > 0
+
+    log.info(
+        "ORDER RESULT: id=%s status=%s filled=%.1f/%.1f @ $%.3f",
+        order_id, status, filled_size, requested_size, avg_price,
+    )
+
+    return FillResult(
+        success=success,
+        order_id=order_id,
+        status=status,
+        requested_size=requested_size,
+        filled_size=filled_size,
+        avg_price=avg_price,
+        is_live=True,
+        raw_response=resp,
+    )
 
 
 def place_sell_order(
