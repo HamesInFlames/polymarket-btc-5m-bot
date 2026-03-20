@@ -42,18 +42,16 @@ ENTRY_WINDOW_START: int = _int("ENTRY_WINDOW_START", 180)
 ENTRY_WINDOW_END: int = _int("ENTRY_WINDOW_END", 5)
 MIN_CONTRACT_PRICE: float = _float("MIN_CONTRACT_PRICE", 0.50)
 MAX_CONTRACT_PRICE: float = _float("MAX_CONTRACT_PRICE", 0.95)
-# Max USDC notional per order (Kelly can be capped here)
-MAX_TRADE_SIZE: float = _float("MAX_TRADE_SIZE", 2.0)
+MAX_TRADE_SIZE: float = _float("MAX_TRADE_SIZE", 10.0)
 LIVE_TRADING: bool = _bool("LIVE_TRADING", False)
 
-# Documented for Railway / README; risk manager is stats-only (no auto-pause)
 MAX_DAILY_LOSS: float = _float("MAX_DAILY_LOSS", 20.0)
 MAX_CONSECUTIVE_LOSSES: int = _int("MAX_CONSECUTIVE_LOSSES", 5)
 
 # ── Kelly / Bankroll parameters ───────────────────────────────
-STARTING_BANKROLL: float = _float("STARTING_BANKROLL", 250.0)
-KELLY_MULTIPLIER: float = _float("KELLY_MULTIPLIER", 0.25)
-MIN_BET_DOLLARS: float = _float("MIN_BET_DOLLARS", 0.50)
+STARTING_BANKROLL: float = _float("STARTING_BANKROLL", 33.69)
+KELLY_MULTIPLIER: float = _float("KELLY_MULTIPLIER", 0.50)
+MIN_BET_DOLLARS: float = _float("MIN_BET_DOLLARS", 2.50)
 VOLATILITY_LOOKBACK: int = _int("VOLATILITY_LOOKBACK", 20)
 CONFIDENCE_FLOOR: float = _float("CONFIDENCE_FLOOR", 0.55)
 
