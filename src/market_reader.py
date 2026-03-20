@@ -162,8 +162,12 @@ def _fetch_round(start_ts: int) -> Optional[MarketRound]:
 def get_order_book_prices(token_id: str) -> dict:
     """
     Fetch the current best bid/ask from the CLOB for a token.
+    Uses both the /book endpoint and the /midpoint endpoint for accuracy.
     Returns {"best_bid": float, "best_ask": float, "mid": float, "spread": float}
     """
+    best_bid = 0.0
+    best_ask = 1.0
+
     try:
         resp = requests.get(
             f"{CLOB_HOST}/book",
@@ -176,20 +180,46 @@ def get_order_book_prices(token_id: str) -> dict:
         bids = book.get("bids", [])
         asks = book.get("asks", [])
 
-        best_bid = float(bids[0]["price"]) if bids else 0.0
-        best_ask = float(asks[0]["price"]) if asks else 1.0
-        mid = (best_bid + best_ask) / 2.0 if bids and asks else 0.0
-        spread = best_ask - best_bid
-
-        return {
-            "best_bid": best_bid,
-            "best_ask": best_ask,
-            "mid": mid,
-            "spread": spread,
-        }
+        if bids:
+            best_bid = float(bids[0]["price"])
+        if asks:
+            best_ask = float(asks[0]["price"])
     except Exception as e:
         log.warning("Order book fetch failed for %s: %s", token_id[:16], e)
-        return {"best_bid": 0.0, "best_ask": 1.0, "mid": 0.5, "spread": 1.0}
+
+    mid_price = 0.5
+    try:
+        resp = requests.get(
+            f"{CLOB_HOST}/midpoint",
+            params={"token_id": token_id},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        mp = float(data.get("mid", 0))
+        if 0.01 < mp < 0.99:
+            mid_price = mp
+    except Exception:
+        pass
+
+    spread = best_ask - best_bid
+    if spread > 0.50:
+        log.warning(
+            "WIDE SPREAD for %s: bid=$%.3f ask=$%.3f spread=$%.3f — using midpoint $%.3f",
+            token_id[:16], best_bid, best_ask, spread, mid_price,
+        )
+        best_bid = max(best_bid, mid_price - 0.02)
+        best_ask = min(best_ask, mid_price + 0.02)
+        spread = best_ask - best_bid
+
+    mid = (best_bid + best_ask) / 2.0
+
+    return {
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "mid": mid,
+        "spread": spread,
+    }
 
 
 def get_midpoint_price(token_id: str) -> float:

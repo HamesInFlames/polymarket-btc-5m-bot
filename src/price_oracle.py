@@ -85,13 +85,23 @@ def get_chainlink_btc_price() -> Optional[float]:
         return None
 
 
+_binance_failures: int = 0
+
 def get_binance_btc_price() -> Optional[float]:
+    global _binance_failures
+    if _binance_failures > 5:
+        return None
     try:
         r = requests.get(BINANCE_BTC_URL, timeout=5)
         r.raise_for_status()
+        _binance_failures = 0
         return float(r.json()["price"])
     except Exception as e:
-        log.warning("Binance fetch failed: %s", e)
+        _binance_failures += 1
+        if _binance_failures <= 3:
+            log.warning("Binance fetch failed: %s", e)
+        elif _binance_failures == 4:
+            log.warning("Binance repeatedly failing — disabling (likely geo-blocked)")
         return None
 
 

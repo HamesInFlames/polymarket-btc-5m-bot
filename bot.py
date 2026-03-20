@@ -18,6 +18,7 @@ Always consult a qualified financial advisor before risking real capital.
 """
 
 import logging
+import random
 import signal
 import sys
 import time
@@ -213,8 +214,7 @@ def main_loop():
                 tracker.mark_traded(rnd.condition_id)
                 trade_count += 1
 
-                pnl = _estimate_pnl(signal)
-                won = pnl > 0
+                pnl, won = _estimate_pnl(signal)
 
                 if won:
                     record_bet_result(True, signal.bet_dollars, signal.size * 1.0)
@@ -292,20 +292,23 @@ def _capture_opening_price(tracker: RoundTracker, rnd: MarketRound):
         tracker.set_opening_price(rnd.condition_id, price)
 
 
-def _estimate_pnl(signal) -> float:
+def _estimate_pnl(signal) -> tuple[float, bool]:
     """
-    In dry-run mode we simulate the outcome probabilistically.
-    Each bet either wins (profit = contracts * (1 - price)) or
-    loses (loss = bet_dollars). We use the estimated win_prob
-    to determine the EV, but for tracking we pick the expected value.
+    In dry-run mode we simulate a REAL binary outcome using the
+    estimated win probability. The bet either wins or loses —
+    no expected-value smoothing — so paper results reflect real variance.
     For live mode, the actual PnL comes from contract resolution.
+
+    Returns (pnl_dollars, won).
     """
     if not LIVE_TRADING:
-        win_profit = signal.size * (1.0 - signal.price)
-        lose_cost = signal.bet_dollars
-        ev = signal.confidence * win_profit - (1.0 - signal.confidence) * lose_cost
-        return ev
-    return 0.0
+        won = random.random() < signal.confidence
+        if won:
+            profit = signal.size * (1.0 - signal.price)
+            return profit, True
+        else:
+            return -signal.bet_dollars, False
+    return 0.0, False
 
 
 def _calculate_sleep(rounds: list[MarketRound]) -> float:
