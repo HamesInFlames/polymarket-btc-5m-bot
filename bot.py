@@ -38,7 +38,7 @@ from src.price_oracle import get_btc_price
 from src.strategy import evaluate_round
 from src.risk_manager import RiskManager
 from src.trader import place_buy_order
-from src.bot_state import state as dashboard, TradeEntry
+from src.bot_state import state as dashboard, TradeEntry, install_log_handler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,6 +49,8 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("web3").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
+
+install_log_handler()
 
 risk = RiskManager()
 
@@ -159,6 +161,7 @@ def main_loop(max_trades: int = 0):
 
         if not rounds:
             log.info("No active BTC 5-min markets found - retrying in 10s")
+            dashboard.clear_rounds()
             _sleep(10)
             continue
 

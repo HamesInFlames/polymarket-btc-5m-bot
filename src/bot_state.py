@@ -3,6 +3,7 @@ Shared bot state — thread-safe store that the trading loop writes to
 and the web dashboard reads from.
 """
 
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -89,6 +90,10 @@ class BotState:
                 }
                 for r in rounds
             ]
+
+    def clear_rounds(self):
+        with self._lock:
+            self.active_rounds = []
 
     def add_trade(self, entry: TradeEntry):
         with self._lock:
@@ -179,3 +184,40 @@ class BotState:
 
 
 state = BotState()
+
+
+class DashboardLogHandler(logging.Handler):
+    """Logging handler that mirrors log records into BotState for the dashboard."""
+
+    _LEVEL_MAP = {
+        logging.DEBUG: "DEBUG",
+        logging.INFO: "INFO",
+        logging.WARNING: "WARN",
+        logging.ERROR: "ERROR",
+        logging.CRITICAL: "ERROR",
+    }
+
+    _NOISY_LOGGERS = frozenset({"urllib3", "web3", "httpx", "uvicorn", "asyncio"})
+
+    def __init__(self, bot_state: BotState):
+        super().__init__(level=logging.INFO)
+        self._state = bot_state
+
+    def emit(self, record: logging.LogRecord):
+        if any(record.name.startswith(n) for n in self._NOISY_LOGGERS):
+            return
+        level = self._LEVEL_MAP.get(record.levelno, "INFO")
+        try:
+            msg = self.format(record) if self.formatter else record.getMessage()
+            self._state.add_log(level, msg)
+            if record.levelno >= logging.ERROR:
+                self._state.set_error(msg)
+        except Exception:
+            pass
+
+
+def install_log_handler():
+    """Call once at startup to pipe all log output into the dashboard state."""
+    handler = DashboardLogHandler(state)
+    handler.setFormatter(logging.Formatter("%(name)-16s  %(message)s"))
+    logging.getLogger().addHandler(handler)
