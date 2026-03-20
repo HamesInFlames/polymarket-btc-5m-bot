@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from src.config import CLOB_HOST, CHAIN_ID, PRIVATE_KEY, LIVE_TRADING
@@ -126,19 +126,19 @@ def place_buy_order(
         client = get_client()
         ot = _parse_order_type(order_type)
 
-        resp = client.create_and_post_order(
+        signed_order = client.create_order(
             OrderArgs(
                 token_id=token_id,
                 price=price,
                 size=size,
                 side=BUY,
             ),
-            options={
-                "tick_size": tick_size,
-                "neg_risk": neg_risk,
-            },
-            order_type=ot,
+            options=PartialCreateOrderOptions(
+                tick_size=tick_size,
+                neg_risk=neg_risk,
+            ),
         )
+        resp = client.post_order(signed_order, orderType=ot)
 
         return _parse_fill_result(resp, requested_size=size, limit_price=price)
 
@@ -233,19 +233,19 @@ def place_sell_order(
         client = get_client()
         ot = _parse_order_type(order_type)
 
-        resp = client.create_and_post_order(
+        signed_order = client.create_order(
             OrderArgs(
                 token_id=token_id,
                 price=price,
                 size=size,
                 side=SELL,
             ),
-            options={
-                "tick_size": tick_size,
-                "neg_risk": neg_risk,
-            },
-            order_type=ot,
+            options=PartialCreateOrderOptions(
+                tick_size=tick_size,
+                neg_risk=neg_risk,
+            ),
         )
+        resp = client.post_order(signed_order, orderType=ot)
         log.info(
             "SELL ORDER: id=%s status=%s type=%s",
             resp.get("orderID", "?"), resp.get("status", "?"), order_type,
