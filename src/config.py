@@ -37,12 +37,18 @@ NEG_RISK_CTF_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
 CHAINLINK_BTC_USD = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
 
 # ── Trading parameters ────────────────────────────────────────
-MIN_EDGE: float = _float("MIN_EDGE", 0.03)
+MIN_EDGE: float = _float("MIN_EDGE", 0.05)
 ENTRY_WINDOW_START: int = _int("ENTRY_WINDOW_START", 180)
 ENTRY_WINDOW_END: int = _int("ENTRY_WINDOW_END", 5)
-MIN_CONTRACT_PRICE: float = _float("MIN_CONTRACT_PRICE", 0.35)
+MIN_CONTRACT_PRICE: float = _float("MIN_CONTRACT_PRICE", 0.50)
 MAX_CONTRACT_PRICE: float = _float("MAX_CONTRACT_PRICE", 0.95)
+# Max USDC notional per order (Kelly can be capped here)
+MAX_TRADE_SIZE: float = _float("MAX_TRADE_SIZE", 2.0)
 LIVE_TRADING: bool = _bool("LIVE_TRADING", False)
+
+# Documented for Railway / README; risk manager is stats-only (no auto-pause)
+MAX_DAILY_LOSS: float = _float("MAX_DAILY_LOSS", 20.0)
+MAX_CONSECUTIVE_LOSSES: int = _int("MAX_CONSECUTIVE_LOSSES", 5)
 
 # ── Kelly / Bankroll parameters ───────────────────────────────
 STARTING_BANKROLL: float = _float("STARTING_BANKROLL", 250.0)

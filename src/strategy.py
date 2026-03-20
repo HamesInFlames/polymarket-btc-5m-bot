@@ -37,6 +37,7 @@ from src.config import (
     ENTRY_WINDOW_END,
     MIN_CONTRACT_PRICE,
     MAX_CONTRACT_PRICE,
+    MAX_TRADE_SIZE,
     KELLY_MULTIPLIER,
     MIN_BET_DOLLARS,
     CONFIDENCE_FLOOR,
@@ -218,6 +219,29 @@ def evaluate_round(
         return None
 
     size = rec.num_contracts
+    if MAX_TRADE_SIZE > 0 and limit_price > 0:
+        max_contracts = MAX_TRADE_SIZE / limit_price
+        if size > max_contracts:
+            log.info(
+                "Kelly size %.1f contracts capped to %.1f by MAX_TRADE_SIZE=$%.2f",
+                size, max_contracts, MAX_TRADE_SIZE,
+            )
+            size = max_contracts
+
+    if size < min_size:
+        log.info(
+            "Size after MAX_TRADE_SIZE cap %.1f below min_order_size %.1f - skipping",
+            size, min_size,
+        )
+        return None
+
+    bet_dollars_adj = (
+        rec.bet_dollars * (size / rec.num_contracts) if rec.num_contracts > 0 else 0.0
+    )
+    ev_adj = (
+        rec.expected_profit * (size / rec.num_contracts) if rec.num_contracts > 0 else 0.0
+    )
+
     action = "BUY_UP" if direction == "up" else "BUY_DOWN"
 
     signal = Signal(
@@ -234,8 +258,8 @@ def evaluate_round(
         neg_risk=market["neg_risk"],
         tick_size=market["tick_size"],
         kelly_fraction=rec.adj_kelly_fraction,
-        bet_dollars=rec.bet_dollars,
-        expected_profit=rec.expected_profit,
+        bet_dollars=bet_dollars_adj,
+        expected_profit=ev_adj,
         bankroll_snapshot=br.current_balance,
         fee_rate_pct=fee_rate * 100,
         effective_price=eff_price,
@@ -247,11 +271,11 @@ def evaluate_round(
             f"limit=${limit_price:.3f} eff=${eff_price:.3f} fee={fee_rate*100:.2f}% | "
             f"bid=${market['best_bid']:.3f} ask=${market['best_ask']:.3f} "
             f"spread=${market['spread']:.3f} last=${market['last_trade_price']:.3f} | "
-            f"Kelly={rec.adj_kelly_fraction:.4f} -> ${rec.bet_dollars:.2f} "
+            f"Kelly={rec.adj_kelly_fraction:.4f} -> ${bet_dollars_adj:.2f} "
             f"({size:.1f} contracts, min={min_size:.0f}) | "
             f"depth={market['bid_depth']:.0f}/{market['ask_depth']:.0f} "
             f"levels={market['book_levels']} | "
-            f"EV=${rec.expected_profit:.4f} | bankroll=${br.current_balance:.2f} | "
+            f"EV=${ev_adj:.4f} | bankroll=${br.current_balance:.2f} | "
             f"{remaining:.0f}s left"
         ),
     )
