@@ -37,15 +37,19 @@ NEG_RISK_CTF_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
 CHAINLINK_BTC_USD = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
 
 # ── Trading parameters ────────────────────────────────────────
-MAX_TRADE_SIZE: float = _float("MAX_TRADE_SIZE", 2.0)
-MIN_EDGE: float = _float("MIN_EDGE", 0.05)
-MAX_DAILY_LOSS: float = _float("MAX_DAILY_LOSS", 20.0)
-MAX_CONSECUTIVE_LOSSES: int = _int("MAX_CONSECUTIVE_LOSSES", 5)
+MIN_EDGE: float = _float("MIN_EDGE", 0.03)
 ENTRY_WINDOW_START: int = _int("ENTRY_WINDOW_START", 180)
 ENTRY_WINDOW_END: int = _int("ENTRY_WINDOW_END", 5)
-MIN_CONTRACT_PRICE: float = _float("MIN_CONTRACT_PRICE", 0.50)
+MIN_CONTRACT_PRICE: float = _float("MIN_CONTRACT_PRICE", 0.35)
 MAX_CONTRACT_PRICE: float = _float("MAX_CONTRACT_PRICE", 0.95)
 LIVE_TRADING: bool = _bool("LIVE_TRADING", False)
+
+# ── Kelly / Bankroll parameters (UNRESTRICTED — max growth) ──
+STARTING_BANKROLL: float = _float("STARTING_BANKROLL", 250.0)
+KELLY_MULTIPLIER: float = _float("KELLY_MULTIPLIER", 1.0)
+MIN_BET_DOLLARS: float = _float("MIN_BET_DOLLARS", 0.50)
+VOLATILITY_LOOKBACK: int = _int("VOLATILITY_LOOKBACK", 20)
+CONFIDENCE_FLOOR: float = _float("CONFIDENCE_FLOOR", 0.55)
 
 # ── External price APIs (fallbacks) ──────────────────────────
 BINANCE_BTC_URL = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"

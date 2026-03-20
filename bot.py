@@ -17,25 +17,21 @@ of loss.  Over 90% of back-tested strategies fail in live markets.
 Always consult a qualified financial advisor before risking real capital.
 """
 
-import argparse
 import logging
 import signal
 import sys
 import time
-from datetime import datetime, timezone
 
 from src.config import (
     LIVE_TRADING,
     ENTRY_WINDOW_START,
     ENTRY_WINDOW_END,
-    MAX_TRADE_SIZE,
     MIN_EDGE,
-    MAX_DAILY_LOSS,
-    MAX_CONSECUTIVE_LOSSES,
+    KELLY_MULTIPLIER,
 )
 from src.market_reader import discover_active_btc_5m_markets, MarketRound
 from src.price_oracle import get_btc_price
-from src.strategy import evaluate_round
+from src.strategy import evaluate_round, get_bankroll, record_bet_result
 from src.risk_manager import RiskManager
 from src.trader import place_buy_order
 from src.bot_state import state as dashboard, TradeEntry, install_log_handler
@@ -71,16 +67,23 @@ if _threading.current_thread() is _threading.main_thread():
 
 def print_banner():
     mode = "LIVE" if LIVE_TRADING else "DRY RUN (paper)"
+    br = get_bankroll()
     print()
     print("=" * 62)
-    print("   Polymarket BTC 5-Min Oracle-Verified Trading Bot")
+    print("   Polymarket BTC 5-Min UNRESTRICTED Kelly Bot")
     print("=" * 62)
     print(f"   Mode:                {mode}")
-    print(f"   Max trade size:      ${MAX_TRADE_SIZE:.2f}")
+    print(f"   Bankroll:            ${br.current_balance:.2f} (started ${br.starting_balance:.2f})")
+    print(f"   Kelly multiplier:    {KELLY_MULTIPLIER:.0%} Kelly (FULL)")
+    print(f"   Bet sizing:          UNRESTRICTED (Kelly decides)")
+    print(f"   Profit reinvestment: 100% (max compounding)")
+    print(f"   Trade limits:        NONE (runs forever)")
     print(f"   Min edge threshold:  {MIN_EDGE*100:.1f}%")
     print(f"   Entry window:        {ENTRY_WINDOW_START}s -> {ENTRY_WINDOW_END}s before close")
-    print(f"   Daily loss limit:    ${MAX_DAILY_LOSS:.2f}")
-    print(f"   Consec. loss limit:  {MAX_CONSECUTIVE_LOSSES}")
+    if br.num_bets > 0:
+        print(f"   Lifetime bets:       {br.num_bets} ({br.win_rate*100:.1f}% win rate)")
+        print(f"   Lifetime P&L:        ${br.total_profit:+.2f} ({br.roi*100:+.1f}% ROI)")
+        print(f"   Current drawdown:    {br.drawdown*100:.1f}%")
     print("=" * 62)
     if not LIVE_TRADING:
         print("   *** DRY RUN - no real orders will be placed ***")
@@ -120,32 +123,23 @@ class RoundTracker:
             self._traded.discard(k)
 
 
-def main_loop(max_trades: int = 0):
+def main_loop():
     tracker = RoundTracker()
     cycle = 0
     trade_count = 0
 
     mode = "LIVE" if LIVE_TRADING else "DRY RUN"
-    dashboard.update_bot_status(True, 0, 0, max_trades, mode)
+    dashboard.update_bot_status(True, 0, 0, 0, mode)
 
     while not _shutdown:
-        if max_trades > 0 and trade_count >= max_trades:
-            log.info("Reached max trades limit (%d) - stopping.", max_trades)
-            break
-
         cycle += 1
-        dashboard.update_bot_status(True, cycle, trade_count, max_trades, mode)
+        dashboard.update_bot_status(True, cycle, trade_count, 0, mode)
 
-        allowed, reason = risk.pre_trade_check()
+        risk.pre_trade_check()
         dashboard.update_risk_stats(risk.stats_summary())
-        if not allowed:
-            log.warning("Risk check blocked: %s - sleeping 60s", reason)
-            dashboard.add_log("WARN", f"Risk blocked: {reason}")
-            _sleep(60)
-            continue
 
-        log.info("-- Cycle %d  [trades: %d/%s] -------------------------",
-                 cycle, trade_count, max_trades or "∞")
+        log.info("-- Cycle %d  [trades: %d] -------------------------",
+                 cycle, trade_count)
 
         try:
             oracle = get_btc_price()
@@ -174,8 +168,6 @@ def main_loop(max_trades: int = 0):
         for rnd in rounds:
             if _shutdown:
                 break
-            if max_trades > 0 and trade_count >= max_trades:
-                break
 
             remaining = rnd.seconds_remaining
 
@@ -200,15 +192,13 @@ def main_loop(max_trades: int = 0):
                 log.info("  -> No signal (edge/confidence/price insufficient)")
                 continue
 
-            allowed, reason = risk.pre_trade_check()
-            if not allowed:
-                log.warning("Risk blocked just before order: %s", reason)
-                break
-
             log.info(
-                ">>> EXECUTING: %s on %s - edge=%.3f, size=%.2f shares @ $%.3f",
+                ">>> EXECUTING: %s on %s | P(win)=%.3f edge=%.4f | "
+                "Kelly=%.4f -> $%.2f (%.1f contracts @ $%.3f) | EV=$%.4f",
                 signal.action, rnd.condition_id[:12],
-                signal.edge, signal.size, signal.price,
+                signal.confidence, signal.edge,
+                signal.kelly_fraction, signal.bet_dollars,
+                signal.size, signal.price, signal.expected_profit,
             )
 
             result = place_buy_order(
@@ -225,8 +215,20 @@ def main_loop(max_trades: int = 0):
 
                 pnl = _estimate_pnl(signal)
                 won = pnl > 0
-                risk.record_pnl(won=won, pnl=pnl, direction=signal.direction)
 
+                if won:
+                    record_bet_result(True, signal.bet_dollars, signal.size * 1.0)
+                else:
+                    record_bet_result(False, signal.bet_dollars)
+
+                risk.record_pnl(
+                    won=won, pnl=pnl, direction=signal.direction,
+                    bet_dollars=signal.bet_dollars,
+                    kelly_fraction=signal.kelly_fraction,
+                    win_prob=signal.confidence,
+                )
+
+                br = get_bankroll()
                 dashboard.add_trade(TradeEntry(
                     timestamp=time.time(),
                     direction=signal.direction,
@@ -244,12 +246,18 @@ def main_loop(max_trades: int = 0):
                 dashboard.update_risk_stats(risk.stats_summary())
                 dashboard.add_log(
                     "INFO",
-                    f"Trade #{trade_count}: {signal.action} edge={signal.edge:.3f} pnl=${pnl:.4f}",
+                    f"Trade #{trade_count}: {signal.action} "
+                    f"edge={signal.edge:.4f} kelly={signal.kelly_fraction:.4f} "
+                    f"bet=${signal.bet_dollars:.2f} pnl=${pnl:.4f} "
+                    f"bankroll=${br.current_balance:.2f}",
                 )
 
                 log.info(
-                    "Trade %d/%s complete | PnL=$%.4f | Total PnL=$%.4f",
-                    trade_count, max_trades or "∞", pnl, risk.total_pnl(),
+                    "Trade #%d | PnL=$%.4f | Bankroll=$%.2f | "
+                    "Drawdown=%.1f%% | Total PnL=$%.4f",
+                    trade_count, pnl,
+                    br.current_balance, br.drawdown * 100,
+                    risk.total_pnl(),
                 )
 
         _print_status(cycle, rounds)
@@ -259,7 +267,7 @@ def main_loop(max_trades: int = 0):
         log.debug("Sleeping %.1fs until next check", sleep_time)
         _sleep(sleep_time)
 
-    dashboard.update_bot_status(False, cycle, trade_count, max_trades, mode)
+    dashboard.update_bot_status(False, cycle, trade_count, 0, mode)
     log.info("Bot shut down gracefully.")
     _print_final_stats()
 
@@ -286,13 +294,17 @@ def _capture_opening_price(tracker: RoundTracker, rnd: MarketRound):
 
 def _estimate_pnl(signal) -> float:
     """
-    In dry-run mode we can't know the real outcome, so we use
-    the edge as a probabilistic estimate.
-    For live mode, the actual PnL would come from contract resolution.
+    In dry-run mode we simulate the outcome probabilistically.
+    Each bet either wins (profit = contracts * (1 - price)) or
+    loses (loss = bet_dollars). We use the estimated win_prob
+    to determine the EV, but for tracking we pick the expected value.
+    For live mode, the actual PnL comes from contract resolution.
     """
     if not LIVE_TRADING:
-        expected_return = signal.edge * signal.size
-        return expected_return
+        win_profit = signal.size * (1.0 - signal.price)
+        lose_cost = signal.bet_dollars
+        ev = signal.confidence * win_profit - (1.0 - signal.confidence) * lose_cost
+        return ev
     return 0.0
 
 
@@ -333,37 +345,39 @@ def _print_status(cycle: int, rounds: list[MarketRound]):
 
 def _print_final_stats():
     stats = risk.stats_summary()
+    br = get_bankroll()
     print()
-    print("=" * 50)
+    print("=" * 58)
     print("  FINAL SESSION STATS")
-    print("=" * 50)
+    print("=" * 58)
     print(f"  Total trades:       {stats['total_trades']}")
     print(f"  Wins / Losses:      {stats['wins']} / {stats['losses']}")
     print(f"  Win rate:           {stats['win_rate']*100:.1f}%")
+    print(f"  Profit factor:      {stats['profit_factor']:.2f}")
+    print(f"  Avg edge:           {stats['avg_edge']*100:.2f}%")
+    print(f"  Avg Kelly fraction: {stats['avg_kelly']*100:.2f}%")
     print(f"  Daily PnL:          ${stats['daily_pnl']:.4f}")
     print(f"  Total PnL:          ${stats['total_pnl']:.4f}")
     print(f"  Consecutive losses: {stats['consecutive_losses']}")
+    print("  " + "-" * 40)
+    print(f"  Bankroll:           ${br.current_balance:.2f}")
+    print(f"  Starting balance:   ${br.starting_balance:.2f}")
+    print(f"  Peak balance:       ${br.peak_balance:.2f}")
+    print(f"  Lifetime P&L:       ${br.total_profit:+.2f}")
+    print(f"  ROI:                {br.roi*100:+.1f}%")
+    print(f"  Drawdown:           {br.drawdown*100:.1f}%")
+    print(f"  Total wagered:      ${br.total_wagered:.2f}")
     print(f"  Paused:             {stats['paused']}")
     if stats["pause_reason"]:
         print(f"  Pause reason:       {stats['pause_reason']}")
-    print("=" * 50)
+    print("=" * 58)
     print()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Polymarket BTC 5-Min Trading Bot")
-    parser.add_argument(
-        "--max-trades", type=int, default=0,
-        help="Stop after N trades (0 = unlimited)",
-    )
-    args = parser.parse_args()
-
     print_banner()
-    if args.max_trades > 0:
-        print(f"   Will stop after {args.max_trades} trade(s).")
-        print()
     try:
-        main_loop(max_trades=args.max_trades)
+        main_loop()
     except KeyboardInterrupt:
         log.info("Interrupted by user")
         _print_final_stats()

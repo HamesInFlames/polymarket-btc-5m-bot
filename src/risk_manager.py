@@ -1,15 +1,13 @@
 """
-Risk Manager
-------------
-Tracks P&L, enforces daily loss limits, consecutive-loss pauses,
-and provides an emergency shutdown flag.
+Risk Manager (v3) — Stats-Only, No Restrictions
+-------------------------------------------------
+Tracks P&L and trade statistics. No pausing, no limits, no blocking.
+Kelly Criterion is the only risk governor — every profit reinvests.
 """
 
 import logging
 import time
 from dataclasses import dataclass, field
-
-from src.config import MAX_DAILY_LOSS, MAX_CONSECUTIVE_LOSSES
 
 log = logging.getLogger(__name__)
 
@@ -25,30 +23,22 @@ class TradeRecord:
     pnl: float = 0.0
     resolved: bool = False
     won: bool = False
+    bet_dollars: float = 0.0
+    kelly_fraction: float = 0.0
+    win_prob: float = 0.0
 
 
 @dataclass
 class RiskManager:
-    max_daily_loss: float = MAX_DAILY_LOSS
-    max_consecutive_losses: int = MAX_CONSECUTIVE_LOSSES
     _trades: list = field(default_factory=list)
-    _paused: bool = False
-    _pause_reason: str = ""
     _day_start: float = field(default_factory=time.time)
-
-    @property
-    def is_paused(self) -> bool:
-        return self._paused
-
-    @property
-    def pause_reason(self) -> str:
-        return self._pause_reason
 
     def record_trade(self, trade: TradeRecord):
         self._trades.append(trade)
         log.info(
-            "Trade recorded: %s %s @ $%.3f, size=$%.2f",
+            "Trade recorded: %s %s @ $%.3f, size=$%.2f, bet=$%.2f, kelly=%.4f",
             trade.direction, trade.token_id[:12], trade.price, trade.size,
+            trade.bet_dollars, trade.kelly_fraction,
         )
 
     def record_result(self, trade_index: int, won: bool, pnl: float):
@@ -58,9 +48,10 @@ class RiskManager:
             t.won = won
             t.pnl = pnl
             log.info("Result: %s PnL=$%.4f", "WIN" if won else "LOSS", pnl)
-        self._check_limits()
 
-    def record_pnl(self, won: bool, pnl: float, direction: str = ""):
+    def record_pnl(self, won: bool, pnl: float, direction: str = "",
+                   bet_dollars: float = 0.0, kelly_fraction: float = 0.0,
+                   win_prob: float = 0.0):
         rec = TradeRecord(
             timestamp=time.time(),
             direction=direction,
@@ -71,28 +62,17 @@ class RiskManager:
             pnl=pnl,
             resolved=True,
             won=won,
+            bet_dollars=bet_dollars,
+            kelly_fraction=kelly_fraction,
+            win_prob=win_prob,
         )
         self._trades.append(rec)
         log.info("Result: %s PnL=$%.4f", "WIN" if won else "LOSS", pnl)
-        self._check_limits()
 
     def pre_trade_check(self) -> tuple[bool, str]:
-        """Returns (allowed, reason). Call before placing any trade."""
-        if self._paused:
-            return False, f"Bot paused: {self._pause_reason}"
-
+        """Always allows trading — no restrictions."""
         self._maybe_reset_day()
-        self._check_limits()
-
-        if self._paused:
-            return False, f"Bot paused: {self._pause_reason}"
-
         return True, "OK"
-
-    def force_resume(self):
-        self._paused = False
-        self._pause_reason = ""
-        log.info("Risk manager manually resumed")
 
     def daily_pnl(self) -> float:
         return sum(
@@ -122,6 +102,25 @@ class RiskManager:
             count += 1
         return count
 
+    def avg_edge(self) -> float:
+        resolved = [t for t in self._trades if t.resolved and t.edge > 0]
+        if not resolved:
+            return 0.0
+        return sum(t.edge for t in resolved) / len(resolved)
+
+    def avg_kelly(self) -> float:
+        resolved = [t for t in self._trades if t.resolved and t.kelly_fraction > 0]
+        if not resolved:
+            return 0.0
+        return sum(t.kelly_fraction for t in resolved) / len(resolved)
+
+    def profit_factor(self) -> float:
+        gross_win = sum(t.pnl for t in self._trades if t.resolved and t.pnl > 0)
+        gross_loss = abs(sum(t.pnl for t in self._trades if t.resolved and t.pnl < 0))
+        if gross_loss == 0:
+            return float("inf") if gross_win > 0 else 0.0
+        return gross_win / gross_loss
+
     def stats_summary(self) -> dict:
         resolved = [t for t in self._trades if t.resolved]
         wins = [t for t in resolved if t.won]
@@ -135,42 +134,21 @@ class RiskManager:
             "daily_pnl": self.daily_pnl(),
             "total_pnl": self.total_pnl(),
             "consecutive_losses": self.consecutive_losses(),
-            "paused": self._paused,
-            "pause_reason": self._pause_reason,
+            "paused": False,
+            "pause_reason": "",
+            "profit_factor": self.profit_factor(),
+            "avg_edge": self.avg_edge(),
+            "avg_kelly": self.avg_kelly(),
         }
-
-    def _check_limits(self):
-        daily = self.daily_pnl()
-        if daily < -self.max_daily_loss:
-            self._paused = True
-            self._pause_reason = (
-                f"Daily loss limit hit: ${daily:.2f} "
-                f"(max -${self.max_daily_loss:.2f})"
-            )
-            log.warning("RISK: %s", self._pause_reason)
-            return
-
-        consec = self.consecutive_losses()
-        if consec >= self.max_consecutive_losses:
-            self._paused = True
-            self._pause_reason = (
-                f"{consec} consecutive losses (max {self.max_consecutive_losses})"
-            )
-            log.warning("RISK: %s", self._pause_reason)
-            return
 
     def _maybe_reset_day(self):
         now = time.time()
         if now - self._day_start > 86400:
             log.info(
-                "Day reset — yesterday PnL: $%.4f, trades: %d",
+                "Day reset -- yesterday PnL: $%.4f, trades: %d",
                 self.daily_pnl(), len([
                     t for t in self._trades
                     if t.timestamp >= self._day_start
                 ]),
             )
             self._day_start = now
-            if self._paused and "Daily loss" in self._pause_reason:
-                self._paused = False
-                self._pause_reason = ""
-                log.info("Daily loss pause lifted on day reset")
