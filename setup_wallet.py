@@ -73,7 +73,11 @@ def generate_wallet():
 def _send_tx(w3: Web3, account, tx):
     tx["nonce"] = w3.eth.get_transaction_count(account.address)
     tx["gas"] = w3.eth.estimate_gas(tx)
-    tx["gasPrice"] = w3.eth.gas_price
+    latest = w3.eth.get_block("latest")
+    base_fee = latest.get("baseFeePerGas", w3.eth.gas_price)
+    tx["maxFeePerGas"] = base_fee * 2
+    tx["maxPriorityFeePerGas"] = w3.to_wei(30, "gwei")
+    tx.pop("gasPrice", None)
     signed = account.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
@@ -87,10 +91,33 @@ def run_approvals():
         print("ERROR: PRIVATE_KEY not set in .env — run  python setup_wallet.py  first")
         sys.exit(1)
 
-    rpc = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
-    w3 = Web3(Web3.HTTPProvider(rpc))
-    if not w3.is_connected():
-        print(f"ERROR: Cannot connect to Polygon RPC at {rpc}")
+    import time
+    rpc_urls = [
+        "https://polygon-bor-rpc.publicnode.com",
+        os.getenv("POLYGON_RPC_URL", ""),
+        "https://polygon.meowrpc.com",
+    ]
+    rpc_urls = [u for u in rpc_urls if u]
+
+    from web3.middleware import ExtraDataToPOAMiddleware
+
+    w3 = None
+    for rpc in rpc_urls:
+        for attempt in range(3):
+            try:
+                w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 15}))
+                w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+                w3.eth.block_number
+                print(f"Connected to RPC: {rpc[:50]}...")
+                break
+            except Exception:
+                time.sleep(2)
+                w3 = None
+        if w3 is not None:
+            break
+
+    if w3 is None:
+        print("ERROR: Cannot connect to any Polygon RPC")
         sys.exit(1)
 
     account = Account.from_key(pk)
@@ -105,34 +132,44 @@ def run_approvals():
         sys.exit(1)
 
     approvals = [
-        ("USDC → CTF Exchange", usdc, CTF_EXCHANGE),
-        ("USDC → NegRisk CTF Exchange", usdc, NEG_RISK_CTF_EXCHANGE),
+        ("USDC -> CTF Exchange", usdc, CTF_EXCHANGE),
+        ("USDC -> NegRisk CTF Exchange", usdc, NEG_RISK_CTF_EXCHANGE),
     ]
 
     ctf = w3.eth.contract(address=CTF_ADDRESS, abi=ERC1155_APPROVAL_ABI)
     erc1155_approvals = [
-        ("CTF → CTF Exchange", ctf, CTF_EXCHANGE),
-        ("CTF → NegRisk CTF Exchange", ctf, NEG_RISK_CTF_EXCHANGE),
-        ("CTF → NegRisk Adapter", ctf, NEG_RISK_ADAPTER),
+        ("CTF -> CTF Exchange", ctf, CTF_EXCHANGE),
+        ("CTF -> NegRisk CTF Exchange", ctf, NEG_RISK_CTF_EXCHANGE),
+        ("CTF -> NegRisk Adapter", ctf, NEG_RISK_ADAPTER),
     ]
 
-    for label, contract, spender in approvals:
-        print(f"  Approving {label} ... ", end="", flush=True)
-        tx = contract.functions.approve(spender, MAX_UINT256).build_transaction(
-            {"from": account.address, "chainId": 137}
-        )
-        receipt = _send_tx(w3, account, tx)
-        status = "OK" if receipt["status"] == 1 else "FAILED"
-        print(f"{status}  tx: {receipt['transactionHash'].hex()}")
+    all_txs = [(l, c, s, "approve") for l, c, s in approvals] + \
+               [(l, c, o, "setApprovalForAll") for l, c, o in erc1155_approvals]
 
-    for label, contract, operator in erc1155_approvals:
+    for label, contract, target, method in all_txs:
         print(f"  Approving {label} ... ", end="", flush=True)
-        tx = contract.functions.setApprovalForAll(operator, True).build_transaction(
-            {"from": account.address, "chainId": 137}
-        )
-        receipt = _send_tx(w3, account, tx)
-        status = "OK" if receipt["status"] == 1 else "FAILED"
-        print(f"{status}  tx: {receipt['transactionHash'].hex()}")
+        for attempt in range(3):
+            try:
+                if method == "approve":
+                    tx = contract.functions.approve(target, MAX_UINT256).build_transaction(
+                        {"from": account.address, "chainId": 137}
+                    )
+                else:
+                    tx = contract.functions.setApprovalForAll(target, True).build_transaction(
+                        {"from": account.address, "chainId": 137}
+                    )
+                receipt = _send_tx(w3, account, tx)
+                status = "OK" if receipt["status"] == 1 else "FAILED"
+                print(f"{status}  tx: {receipt['transactionHash'].hex()}")
+                time.sleep(3)
+                break
+            except Exception as e:
+                if "nonce" in str(e).lower() and attempt < 2:
+                    print(f"nonce conflict, retrying...", end=" ", flush=True)
+                    time.sleep(5)
+                else:
+                    print(f"FAILED: {e}")
+                    break
 
     print("\nAll approvals complete. You can now run the bot.")
 

@@ -111,25 +111,36 @@ def clob_geoblock_status() -> dict:
 def probe_clob_trading(timeout: int = 10) -> bool:
     """
     Probe the CLOB server to detect trading-level geoblock.
-    Uses a lightweight endpoint that still goes through
-    Cloudflare / geoblock enforcement.
+
+    Tests both GET and POST endpoints because the CLOB enforces
+    geoblock more aggressively on POST (order submission) than GET.
     Returns True if CLOB is reachable (not geoblocked).
     """
     try:
         resp = requests.get(f"{CLOB_HOST}/time", timeout=timeout)
         if resp.status_code == 403:
+            return False
+
+        resp_post = requests.post(
+            f"{CLOB_HOST}/order",
+            json={},
+            headers={"Content-Type": "application/json"},
+            timeout=timeout,
+        )
+        if resp_post.status_code == 403:
             body = ""
             try:
-                body = resp.text[:500]
+                body = resp_post.text[:500].lower()
             except Exception:
                 pass
-            if "restricted" in body.lower() or "geoblock" in body.lower() or "blocked" in body.lower():
+            if "restricted" in body or "geoblock" in body or "blocked" in body or "region" in body:
+                log.warning("CLOB POST /order returned 403 geoblock")
                 return False
-            return False
-        return resp.status_code == 200
+        # 400/401/422 = not geoblocked, just bad request (expected with empty body)
+        return True
     except requests.exceptions.RequestException as e:
         log.warning("CLOB probe failed (network error): %s", e)
-        return True  # don't block on network errors, let real orders determine
+        return True
 
 
 def check_geoblock(timeout: int = 10) -> dict:

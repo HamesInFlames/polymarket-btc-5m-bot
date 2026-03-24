@@ -44,7 +44,13 @@ AGGREGATOR_V3_ABI = json.loads("""[
     ],"stateMutability":"view","type":"function"}
 ]""")
 
+_FALLBACK_RPCS = [
+    POLYGON_RPC_URL,
+    "https://polygon-bor-rpc.publicnode.com",
+]
+
 _w3: Optional[Web3] = None
+_w3_index: int = 0
 _chainlink_contract = None
 _chainlink_decimals: Optional[int] = None
 
@@ -53,24 +59,41 @@ _coingecko_cooldown: float = 15.0
 
 
 def _get_w3() -> Web3:
-    global _w3
+    global _w3, _w3_index
     if _w3 is None:
-        _w3 = Web3(Web3.HTTPProvider(POLYGON_RPC_URL))
+        _w3 = Web3(Web3.HTTPProvider(_FALLBACK_RPCS[_w3_index]))
     return _w3
 
 
+def _rotate_rpc():
+    """Switch to the next fallback RPC on repeated failures."""
+    global _w3, _w3_index, _chainlink_contract, _chainlink_decimals
+    _w3_index = (_w3_index + 1) % len(_FALLBACK_RPCS)
+    _w3 = None
+    _chainlink_contract = None
+    _chainlink_decimals = None
+    log.info("Rotating to fallback RPC: %s", _FALLBACK_RPCS[_w3_index][:50])
+
+
+_rpc_fail_count: int = 0
+
+
 def _get_chainlink():
-    global _chainlink_contract, _chainlink_decimals
-    if _chainlink_contract is None:
+    global _chainlink_contract, _chainlink_decimals, _rpc_fail_count
+    if _chainlink_contract is None or _chainlink_decimals is None:
+        _chainlink_contract = None
+        _chainlink_decimals = None
         w3 = _get_w3()
         addr = Web3.to_checksum_address(CHAINLINK_BTC_USD)
         _chainlink_contract = w3.eth.contract(address=addr, abi=AGGREGATOR_V3_ABI)
         _chainlink_decimals = _chainlink_contract.functions.decimals().call()
+        _rpc_fail_count = 0
     return _chainlink_contract, _chainlink_decimals
 
 
 def get_chainlink_btc_price() -> Optional[float]:
     """Fetch BTC/USD from Chainlink on-chain aggregator (Polygon)."""
+    global _rpc_fail_count
     try:
         contract, decimals = _get_chainlink()
         data = contract.functions.latestRoundData().call()
@@ -79,8 +102,12 @@ def get_chainlink_btc_price() -> Optional[float]:
         age = time.time() - updated_at
         if age > 300:
             log.warning("Chainlink price is %.0fs stale", age)
+        _rpc_fail_count = 0
         return float(answer) / (10 ** decimals)
     except Exception as e:
+        _rpc_fail_count += 1
+        if _rpc_fail_count >= 3:
+            _rotate_rpc()
         log.warning("Chainlink fetch failed: %s", e)
         return None
 

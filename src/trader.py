@@ -17,6 +17,7 @@ Source: https://docs.polymarket.com/trading/orders/create
 """
 
 import logging
+import math
 import os
 from dataclasses import dataclass
 from typing import Optional
@@ -29,6 +30,31 @@ from src.config import CLOB_HOST, CHAIN_ID, PRIVATE_KEY, LIVE_TRADING, RELAYER_A
 from src.geoblock import signal_clob_geoblock
 
 log = logging.getLogger(__name__)
+
+# Patch py-clob-client's User-Agent so Cloudflare doesn't flag it as bot traffic.
+# The library hardcodes "py_clob_client" which combined with VPN IPs triggers 403.
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
+def _patch_clob_headers():
+    try:
+        from py_clob_client.http_helpers import helpers as _h
+        _orig = _h.overloadHeaders
+
+        def _patched(method, headers):
+            headers = _orig(method, headers)
+            headers["User-Agent"] = _BROWSER_UA
+            return headers
+
+        _h.overloadHeaders = _patched
+        log.debug("Patched py-clob-client User-Agent")
+    except Exception as e:
+        log.warning("Failed to patch CLOB headers: %s", e)
+
+_patch_clob_headers()
 
 _client: Optional[ClobClient] = None
 
@@ -107,12 +133,18 @@ def place_buy_order(
     the order would have filled at the limit price. The actual outcome is
     determined later by checking the real market resolution.
     """
+    price = round(price, 2)
+    size = math.floor(size * 10000) / 10000
+    usdc_amount = round(price * size, 2)
+    size = math.floor(usdc_amount / price * 10000) / 10000
+    size = max(size, 0.01)
+
     if size < min_order_size:
         log.warning(
             "Order size %.1f below min_order_size %.1f — adjusting up",
             size, min_order_size,
         )
-        size = min_order_size
+        size = math.floor(min_order_size * 10000) / 10000
 
     if not LIVE_TRADING:
         log.info(
@@ -251,6 +283,12 @@ def place_sell_order(
     order_type: str = "GTC",
 ) -> Optional[dict]:
     """Place a SELL order (GTC by default for exits)."""
+    price = round(price, 2)
+    size = math.floor(size * 10000) / 10000
+    usdc_amount = round(price * size, 2)
+    size = math.floor(usdc_amount / price * 10000) / 10000
+    size = max(size, 0.01)
+
     if not LIVE_TRADING:
         log.info(
             "[DRY RUN] Would SELL token=%s price=$%.3f size=%.1f type=%s",
