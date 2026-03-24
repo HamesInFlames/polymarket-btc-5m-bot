@@ -45,8 +45,9 @@ AGGREGATOR_V3_ABI = json.loads("""[
 ]""")
 
 _FALLBACK_RPCS = [
-    POLYGON_RPC_URL,
     "https://polygon-bor-rpc.publicnode.com",
+    "https://lb.drpc.live/polygon/Ap8ogyqJAUcJlUcxScSgw3bEgv-MJzsR8YH_urWHF38a",
+    "https://polygon.meowrpc.com",
 ]
 
 _w3: Optional[Web3] = None

@@ -40,7 +40,7 @@ from src.market_reader import (
     extract_reference_price,
 )
 from src.price_oracle import get_btc_price
-from src.strategy import evaluate_round, get_bankroll, record_bet_result
+from src.strategy import evaluate_round, get_bankroll, record_bet_result, sync_bankroll_to_balance
 from src.risk_manager import RiskManager
 from src.trader import place_buy_order, FillResult
 from src.fees import effective_fee_rate
@@ -201,7 +201,10 @@ def main_loop():
             _last_wallet_cycle = cycle
             try:
                 wb = fetch_wallet_balances()
-                dashboard.update_wallet(wb["address"], wb["usdc"], wb["pol"])
+                sync_bankroll_to_balance(wb["usdc"])
+                br = get_bankroll()
+                dashboard.update_wallet(wb["address"], wb["usdc"], wb["pol"],
+                                        bankroll=br.current_balance)
             except Exception as e:
                 log.debug("Wallet balance fetch failed: %s", e)
 
@@ -521,6 +524,14 @@ def _record_resolution(trade: PendingTrade, won: bool, outcome: str):
 
     if won:
         record_bet_result(True, trade.bet_dollars, payout)
+        try:
+            tx = redeem_winning_position(trade.condition_id, neg_risk=trade.neg_risk)
+            if tx:
+                log.info("Redeemed winnings for %s: tx=%s", trade.condition_id[:12], tx)
+            else:
+                log.warning("Redeem returned None for %s", trade.condition_id[:12])
+        except Exception as e:
+            log.warning("Auto-redeem failed for %s: %s", trade.condition_id[:12], e)
     else:
         record_bet_result(False, trade.bet_dollars)
 
@@ -683,10 +694,13 @@ if __name__ == "__main__":
         print()
         sys.exit(1)
 
-    # Fetch wallet balances at startup
+    # Fetch wallet balances at startup and sync bankroll
     try:
         wb = fetch_wallet_balances()
-        dashboard.update_wallet(wb["address"], wb["usdc"], wb["pol"])
+        sync_bankroll_to_balance(wb["usdc"])
+        br = get_bankroll()
+        dashboard.update_wallet(wb["address"], wb["usdc"], wb["pol"],
+                                bankroll=br.current_balance)
         print(f"   Wallet:              {wb['address'][:8]}...{wb['address'][-6:]}")
         print(f"   USDC balance:        ${wb['usdc']:.4f}")
         print(f"   POL balance:         {wb['pol']:.4f}")

@@ -62,6 +62,7 @@ class BotState:
         self.wallet_usdc: float = 0.0
         self.wallet_pol: float = 0.0
         self.wallet_updated_at: float = 0.0
+        self.bankroll: float = 0.0
 
     def update_bot_status(self, running: bool, cycle: int, trade_count: int,
                           max_trades: int, mode: str):
@@ -128,12 +129,15 @@ class BotState:
             self.paused = stats.get("paused", False)
             self.pause_reason = stats.get("pause_reason", "")
 
-    def update_wallet(self, address: str, usdc: float, pol: float):
+    def update_wallet(self, address: str, usdc: float, pol: float,
+                      bankroll: float | None = None):
         with self._lock:
             self.wallet_address = address
             self.wallet_usdc = usdc
             self.wallet_pol = pol
             self.wallet_updated_at = time.time()
+            if bankroll is not None:
+                self.bankroll = bankroll
 
     def set_error(self, error: str):
         with self._lock:
@@ -204,6 +208,7 @@ class BotState:
                     "address": self.wallet_address,
                     "usdc": self.wallet_usdc,
                     "pol": self.wallet_pol,
+                    "bankroll": self.bankroll,
                     "updated_at": self.wallet_updated_at,
                 },
                 "error": {

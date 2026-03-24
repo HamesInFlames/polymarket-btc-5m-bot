@@ -286,8 +286,9 @@ canvas{width:100%!important;height:100%!important}
       <div class="sources" id="btc-sources"></div>
     </div>
     <div class="card" id="card-wallet">
-      <div class="card-label">Wallet (USDC)</div>
+      <div class="card-label">Wallet (USDC.e)</div>
       <div class="card-value green" id="wallet-usdc">—</div>
+      <div class="card-sub" id="wallet-bankroll">Bankroll: —</div>
       <div class="card-sub" id="wallet-pol">POL: —</div>
       <div class="card-sub" id="wallet-addr" style="color:var(--text-muted);font-size:.6rem;margin-top:.2rem;word-break:break-all"></div>
     </div>
@@ -617,6 +618,9 @@ function updateCards(data){
     flashIfChanged('wallet-usdc', wallet.usdc, walletCard, 'flash-neutral');
     usdcEl.textContent = usdcStr;
     usdcEl.className = 'card-value ' + (wallet.usdc > 0 ? 'green' : 'red');
+    const bankroll = wallet.bankroll || 0;
+    const brStr = '$' + bankroll.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+    document.getElementById('wallet-bankroll').textContent = 'Bankroll: ' + brStr;
     document.getElementById('wallet-pol').textContent = 'POL: ' + wallet.pol.toFixed(4);
     const addr = wallet.address;
     document.getElementById('wallet-addr').textContent = addr.slice(0,6) + '...' + addr.slice(-4);

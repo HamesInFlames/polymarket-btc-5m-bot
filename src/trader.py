@@ -26,7 +26,7 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
 from py_clob_client.order_builder.constants import BUY, SELL
 
-from src.config import CLOB_HOST, CHAIN_ID, PRIVATE_KEY, LIVE_TRADING, RELAYER_API_KEY
+from src.config import CLOB_HOST, CHAIN_ID, PRIVATE_KEY, LIVE_TRADING, RELAYER_API_KEY, USDC_ADDRESS
 from src.geoblock import signal_clob_geoblock
 
 log = logging.getLogger(__name__)
@@ -57,6 +57,35 @@ def _patch_clob_headers():
 _patch_clob_headers()
 
 _client: Optional[ClobClient] = None
+_cached_usdc: Optional[float] = None
+_last_balance_check: float = 0.0
+
+
+def _check_usdc_balance() -> float:
+    """Quick on-chain USDC.e balance check with 30s cache."""
+    global _cached_usdc, _last_balance_check
+    import time
+    now = time.time()
+    if _cached_usdc is not None and (now - _last_balance_check) < 30:
+        return _cached_usdc
+    try:
+        from web3 import Web3
+        w3 = Web3(Web3.HTTPProvider("https://polygon-bor-rpc.publicnode.com",
+                                     request_kwargs={"timeout": 5}))
+        from eth_account import Account
+        addr = Account.from_key(PRIVATE_KEY).address
+        abi = [{"inputs": [{"name": "account", "type": "address"}],
+                "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}],
+                "stateMutability": "view", "type": "function"}]
+        contract = w3.eth.contract(
+            address=Web3.to_checksum_address(USDC_ADDRESS), abi=abi)
+        raw = contract.functions.balanceOf(addr).call()
+        _cached_usdc = raw / 1e6
+        _last_balance_check = now
+        return _cached_usdc
+    except Exception as e:
+        log.debug("Balance check failed: %s", e)
+        return _cached_usdc if _cached_usdc is not None else 999.0
 
 
 @dataclass
@@ -145,6 +174,27 @@ def place_buy_order(
             size, min_order_size,
         )
         size = math.floor(min_order_size * 10000) / 10000
+
+    usdc_needed = round(price * size, 2)
+    available = _check_usdc_balance()
+    if available < usdc_needed:
+        log.warning(
+            "Insufficient USDC.e: need $%.2f but wallet has $%.2f — reducing order",
+            usdc_needed, available,
+        )
+        if available < 1.0:
+            return FillResult(
+                success=False, order_id="", status="INSUFFICIENT_BALANCE",
+                requested_size=size, filled_size=0, avg_price=price,
+            )
+        size = math.floor((available * 0.95 / price) * 10000) / 10000
+        usdc_needed = round(price * size, 2)
+        if size < 1.0:
+            return FillResult(
+                success=False, order_id="", status="INSUFFICIENT_BALANCE",
+                requested_size=size, filled_size=0, avg_price=price,
+            )
+        log.info("Adjusted order: %.1f contracts ($%.2f)", size, usdc_needed)
 
     if not LIVE_TRADING:
         log.info(

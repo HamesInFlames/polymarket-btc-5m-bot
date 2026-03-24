@@ -58,6 +58,7 @@ log = logging.getLogger(__name__)
 
 _bankroll: Optional[Bankroll] = None
 _price_history: deque[tuple[float, float]] = deque(maxlen=120)
+_cached_usdc_balance: Optional[float] = None
 
 
 def get_bankroll() -> Bankroll:
@@ -65,6 +66,24 @@ def get_bankroll() -> Bankroll:
     if _bankroll is None:
         _bankroll = load_bankroll(STARTING_BANKROLL)
     return _bankroll
+
+
+def sync_bankroll_to_balance(usdc_balance: float):
+    """
+    Sync bankroll with actual on-chain USDC.e balance.
+    Prevents Kelly from sizing bets larger than available funds.
+    """
+    global _cached_usdc_balance
+    _cached_usdc_balance = usdc_balance
+    br = get_bankroll()
+    if usdc_balance < br.current_balance:
+        old = br.current_balance
+        br.current_balance = usdc_balance
+        save_bankroll(br)
+        log.info(
+            "Bankroll synced to on-chain balance: $%.2f -> $%.2f",
+            old, usdc_balance,
+        )
 
 
 def record_bet_result(won: bool, wager: float, payout: float = 0.0):

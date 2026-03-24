@@ -66,14 +66,29 @@ _w3: Optional[Web3] = None
 _account = None
 
 
+_REDEEMER_RPCS = [
+    "https://polygon-bor-rpc.publicnode.com",
+    POLYGON_RPC_URL,
+    "https://polygon.meowrpc.com",
+]
+
+
 def _get_web3():
     global _w3, _account
     if _w3 is not None:
         return _w3, _account
 
-    _w3 = Web3(Web3.HTTPProvider(POLYGON_RPC_URL))
-    if not _w3.is_connected():
-        raise RuntimeError(f"Cannot connect to Polygon RPC: {POLYGON_RPC_URL}")
+    for rpc in _REDEEMER_RPCS:
+        try:
+            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
+            w3.eth.block_number
+            _w3 = w3
+            break
+        except Exception:
+            continue
+
+    if _w3 is None:
+        raise RuntimeError("Cannot connect to any Polygon RPC")
 
     _account = Account.from_key(PRIVATE_KEY)
     log.info("Redeemer web3 connected, wallet %s", _account.address)
@@ -123,6 +138,9 @@ def _redeem_standard(w3, acct, address, condition_id_bytes) -> Optional[str]:
         abi=CTF_REDEEM_ABI,
     )
 
+    latest = w3.eth.get_block("latest")
+    base_fee = latest.get("baseFeePerGas", w3.eth.gas_price)
+
     txn = ctf.functions.redeemPositions(
         Web3.to_checksum_address(USDC_ADDRESS),
         HASH_ZERO,
@@ -132,7 +150,8 @@ def _redeem_standard(w3, acct, address, condition_id_bytes) -> Optional[str]:
         "from": address,
         "nonce": w3.eth.get_transaction_count(address),
         "gas": 300_000,
-        "gasPrice": w3.eth.gas_price,
+        "maxFeePerGas": base_fee * 2,
+        "maxPriorityFeePerGas": w3.to_wei(30, "gwei"),
         "chainId": CHAIN_ID,
     })
 
@@ -158,6 +177,9 @@ def _redeem_neg_risk(w3, acct, address, condition_id_bytes) -> Optional[str]:
         abi=NEG_RISK_REDEEM_ABI,
     )
 
+    latest = w3.eth.get_block("latest")
+    base_fee = latest.get("baseFeePerGas", w3.eth.gas_price)
+
     txn = contract.functions.redeemPositions(
         condition_id_bytes,
         [0, 0],
@@ -165,7 +187,8 @@ def _redeem_neg_risk(w3, acct, address, condition_id_bytes) -> Optional[str]:
         "from": address,
         "nonce": w3.eth.get_transaction_count(address),
         "gas": 300_000,
-        "gasPrice": w3.eth.gas_price,
+        "maxFeePerGas": base_fee * 2,
+        "maxPriorityFeePerGas": w3.to_wei(30, "gwei"),
         "chainId": CHAIN_ID,
     })
 

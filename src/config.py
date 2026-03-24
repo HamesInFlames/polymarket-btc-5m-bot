@@ -22,13 +22,13 @@ def _bool(key: str, default: bool) -> bool:
 
 # ── Wallet / RPC ──────────────────────────────────────────────
 PRIVATE_KEY: str = os.getenv("PRIVATE_KEY", "")
-POLYGON_RPC_URL: str = os.getenv("POLYGON_RPC_URL", "https://polygon.drpc.org")
+POLYGON_RPC_URL: str = os.getenv("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com")
 CHAIN_ID: int = 137
 CLOB_HOST: str = "https://clob.polymarket.com"
 GAMMA_HOST: str = "https://gamma-api.polymarket.com"
 
 # ── Wallet ────────────────────────────────────────────────────
-WALLET_ADDRESS: str = os.getenv("WALLET_ADDRESS", "0x96418edEc291543e0e7Cb2Ef90aEEb050B2E05d1")
+WALLET_ADDRESS: str = os.getenv("WALLET_ADDRESS", "")
 
 # ── Contract addresses (Polygon) ─────────────────────────────
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
