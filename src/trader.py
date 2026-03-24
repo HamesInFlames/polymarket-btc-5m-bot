@@ -163,17 +163,11 @@ def place_buy_order(
     determined later by checking the real market resolution.
     """
     price = round(price, 2)
-    size = math.floor(size * 10000) / 10000
-    usdc_amount = round(price * size, 2)
-    size = math.floor(usdc_amount / price * 10000) / 10000
-    size = max(size, 0.01)
+    size = math.floor(size)
+    size = max(size, 1)
 
     if size < min_order_size:
-        log.warning(
-            "Order size %.1f below min_order_size %.1f — adjusting up",
-            size, min_order_size,
-        )
-        size = math.floor(min_order_size * 10000) / 10000
+        size = math.ceil(min_order_size)
 
     usdc_needed = round(price * size, 2)
     available = _check_usdc_balance()
@@ -334,10 +328,8 @@ def place_sell_order(
 ) -> Optional[dict]:
     """Place a SELL order (GTC by default for exits)."""
     price = round(price, 2)
-    size = math.floor(size * 10000) / 10000
-    usdc_amount = round(price * size, 2)
-    size = math.floor(usdc_amount / price * 10000) / 10000
-    size = max(size, 0.01)
+    size = math.floor(size)
+    size = max(size, 1)
 
     if not LIVE_TRADING:
         log.info(

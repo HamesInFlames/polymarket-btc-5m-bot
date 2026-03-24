@@ -71,14 +71,17 @@ def get_bankroll() -> Bankroll:
 def sync_bankroll_to_balance(usdc_balance: float):
     """
     Sync bankroll with actual on-chain USDC.e balance.
-    Prevents Kelly from sizing bets larger than available funds.
+    Always sets bankroll to match real wallet balance so Kelly
+    sizes bets correctly in both directions (deposits/redemptions up,
+    losses/withdrawals down).
     """
     global _cached_usdc_balance
     _cached_usdc_balance = usdc_balance
     br = get_bankroll()
-    if usdc_balance < br.current_balance:
+    if abs(usdc_balance - br.current_balance) > 0.01:
         old = br.current_balance
         br.current_balance = usdc_balance
+        br.peak_balance = max(br.peak_balance, usdc_balance)
         save_bankroll(br)
         log.info(
             "Bankroll synced to on-chain balance: $%.2f -> $%.2f",

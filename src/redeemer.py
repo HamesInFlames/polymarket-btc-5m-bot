@@ -4,12 +4,17 @@ Auto-Redeemer — converts winning outcome tokens back to USDC after resolution.
 Uses direct on-chain calls to the CTF contract's redeemPositions().
 For EOA wallets this is a simple web3 transaction costing ~0.001 POL gas.
 
+Non-blocking: redeems run in a background thread so the main loop stays free
+to discover and trade the next round. A callback fires on completion to
+trigger an immediate wallet balance refresh.
+
 Reference: https://docs.polymarket.com/trading/ctf/redeem
 """
 
 import logging
+import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from web3 import Web3
 from eth_account import Account
@@ -64,6 +69,15 @@ NEG_RISK_REDEEM_ABI = [
 
 _w3: Optional[Web3] = None
 _account = None
+_w3_lock = threading.Lock()
+
+_on_redeem_complete: Optional[Callable[[str, bool], None]] = None
+
+
+def set_redeem_callback(callback: Callable[[str, bool], None]):
+    """Register a callback(condition_id, success) invoked when a background redeem finishes."""
+    global _on_redeem_complete
+    _on_redeem_complete = callback
 
 
 _REDEEMER_RPCS = [
@@ -73,26 +87,41 @@ _REDEEMER_RPCS = [
 ]
 
 
+def _reset_web3():
+    """Force reconnection on next call (e.g. after RPC failure)."""
+    global _w3, _account
+    with _w3_lock:
+        _w3 = None
+        _account = None
+
+
 def _get_web3():
     global _w3, _account
-    if _w3 is not None:
+    with _w3_lock:
+        if _w3 is not None:
+            try:
+                _w3.eth.block_number
+                return _w3, _account
+            except Exception:
+                log.warning("Stale RPC connection — reconnecting")
+                _w3 = None
+                _account = None
+
+        for rpc in _REDEEMER_RPCS:
+            try:
+                w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
+                w3.eth.block_number
+                _w3 = w3
+                break
+            except Exception:
+                continue
+
+        if _w3 is None:
+            raise RuntimeError("Cannot connect to any Polygon RPC")
+
+        _account = Account.from_key(PRIVATE_KEY)
+        log.info("Redeemer web3 connected, wallet %s", _account.address)
         return _w3, _account
-
-    for rpc in _REDEEMER_RPCS:
-        try:
-            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
-            w3.eth.block_number
-            _w3 = w3
-            break
-        except Exception:
-            continue
-
-    if _w3 is None:
-        raise RuntimeError("Cannot connect to any Polygon RPC")
-
-    _account = Account.from_key(PRIVATE_KEY)
-    log.info("Redeemer web3 connected, wallet %s", _account.address)
-    return _w3, _account
 
 
 def redeem_winning_position(
@@ -101,13 +130,9 @@ def redeem_winning_position(
 ) -> Optional[str]:
     """
     Redeem winning outcome tokens for a resolved market.
-
-    Args:
-        condition_id: The market condition ID (hex string with 0x prefix)
-        neg_risk: Whether this is a neg-risk market
-
-    Returns:
-        Transaction hash on success, None on failure.
+    NON-BLOCKING: sends the tx and waits for receipt in a background thread.
+    Returns the tx hash immediately after broadcast (before confirmation).
+    The on_redeem_complete callback fires when the receipt arrives.
     """
     if not PRIVATE_KEY:
         log.warning("No PRIVATE_KEY — cannot redeem on-chain")
@@ -122,17 +147,87 @@ def redeem_winning_position(
         cond_bytes = bytes.fromhex(condition_id[2:].zfill(64))
 
         if neg_risk:
-            return _redeem_neg_risk(w3, acct, address, cond_bytes)
+            tx_hash = _send_neg_risk_tx(w3, acct, address, cond_bytes)
         else:
-            return _redeem_standard(w3, acct, address, cond_bytes)
+            tx_hash = _send_standard_tx(w3, acct, address, cond_bytes)
+
+        if tx_hash is None:
+            return None
+
+        hex_hash = tx_hash.hex()
+        log.info("Redeem tx broadcast: %s — waiting for receipt in background", hex_hash)
+
+        t = threading.Thread(
+            target=_wait_for_receipt,
+            args=(w3, tx_hash, condition_id, hex_hash),
+            daemon=True,
+            name=f"redeem-{condition_id[:12]}",
+        )
+        t.start()
+
+        return hex_hash
 
     except Exception as e:
         log.error("Redemption failed for %s: %s", condition_id[:16], e)
+        _reset_web3()
         return None
 
 
-def _redeem_standard(w3, acct, address, condition_id_bytes) -> Optional[str]:
-    """Standard CTF redemption: redeemPositions(collateral, parent, conditionId, [1,2])"""
+def redeem_winning_position_blocking(
+    condition_id: str,
+    neg_risk: bool = False,
+) -> Optional[str]:
+    """Blocking version for standalone scripts (redeem_winnings.py)."""
+    if not PRIVATE_KEY:
+        return None
+    try:
+        w3, acct = _get_web3()
+        address = acct.address
+        if not condition_id.startswith("0x"):
+            condition_id = "0x" + condition_id
+        cond_bytes = bytes.fromhex(condition_id[2:].zfill(64))
+        if neg_risk:
+            tx_hash = _send_neg_risk_tx(w3, acct, address, cond_bytes)
+        else:
+            tx_hash = _send_standard_tx(w3, acct, address, cond_bytes)
+        if tx_hash is None:
+            return None
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        hex_hash = tx_hash.hex()
+        if receipt["status"] == 1:
+            log.info("Redeem SUCCESS: %s (gas: %d)", hex_hash, receipt["gasUsed"])
+            return hex_hash
+        log.error("Redeem REVERTED: %s", hex_hash)
+        return None
+    except Exception as e:
+        log.error("Blocking redeem failed for %s: %s", condition_id[:16], e)
+        _reset_web3()
+        return None
+
+
+def _wait_for_receipt(w3, tx_hash, condition_id: str, hex_hash: str):
+    """Background thread: wait for tx confirmation, then fire callback."""
+    success = False
+    try:
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
+        if receipt["status"] == 1:
+            log.info("Redeem CONFIRMED: %s (gas: %d)", hex_hash, receipt["gasUsed"])
+            success = True
+        else:
+            log.error("Redeem REVERTED: %s", hex_hash)
+    except Exception as e:
+        log.error("Redeem receipt wait failed for %s: %s", hex_hash, e)
+        _reset_web3()
+
+    if _on_redeem_complete:
+        try:
+            _on_redeem_complete(condition_id, success)
+        except Exception as e:
+            log.error("Redeem callback error: %s", e)
+
+
+def _send_standard_tx(w3, acct, address, condition_id_bytes):
+    """Build, sign, and broadcast a standard CTF redemption tx. Returns tx_hash or None."""
     ctf = w3.eth.contract(
         address=Web3.to_checksum_address(CTF_ADDRESS),
         abi=CTF_REDEEM_ABI,
@@ -156,22 +251,11 @@ def _redeem_standard(w3, acct, address, condition_id_bytes) -> Optional[str]:
     })
 
     signed = acct.sign_transaction(txn)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    hex_hash = tx_hash.hex()
-
-    log.info("Redeem tx sent: %s (waiting for confirmation...)", hex_hash)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-
-    if receipt["status"] == 1:
-        log.info("Redeem SUCCESS: %s (gas used: %d)", hex_hash, receipt["gasUsed"])
-        return hex_hash
-    else:
-        log.error("Redeem REVERTED: %s", hex_hash)
-        return None
+    return w3.eth.send_raw_transaction(signed.raw_transaction)
 
 
-def _redeem_neg_risk(w3, acct, address, condition_id_bytes) -> Optional[str]:
-    """Neg-risk redemption via the NegRiskCTFExchange contract."""
+def _send_neg_risk_tx(w3, acct, address, condition_id_bytes):
+    """Build, sign, and broadcast a neg-risk redemption tx. Returns tx_hash or None."""
     contract = w3.eth.contract(
         address=Web3.to_checksum_address(NEG_RISK_CTF_EXCHANGE),
         abi=NEG_RISK_REDEEM_ABI,
@@ -193,18 +277,7 @@ def _redeem_neg_risk(w3, acct, address, condition_id_bytes) -> Optional[str]:
     })
 
     signed = acct.sign_transaction(txn)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    hex_hash = tx_hash.hex()
-
-    log.info("Neg-risk redeem tx sent: %s", hex_hash)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-
-    if receipt["status"] == 1:
-        log.info("Neg-risk redeem SUCCESS: %s (gas: %d)", hex_hash, receipt["gasUsed"])
-        return hex_hash
-    else:
-        log.error("Neg-risk redeem REVERTED: %s", hex_hash)
-        return None
+    return w3.eth.send_raw_transaction(signed.raw_transaction)
 
 
 def check_pol_balance() -> float:

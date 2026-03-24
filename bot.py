@@ -45,7 +45,7 @@ from src.risk_manager import RiskManager
 from src.trader import place_buy_order, FillResult
 from src.fees import effective_fee_rate
 from src.bot_state import state as dashboard, TradeEntry, install_log_handler
-from src.redeemer import redeem_winning_position, check_pol_balance, fetch_wallet_balances
+from src.redeemer import redeem_winning_position, check_pol_balance, fetch_wallet_balances, set_redeem_callback
 from src.geoblock import (
     assert_not_geoblocked, check_geoblock,
     is_clob_geoblocked, clob_geoblock_status,
@@ -71,9 +71,13 @@ risk = RiskManager()
 
 _shutdown = False
 
-RESOLUTION_WAIT_SECONDS = 20
-RESOLUTION_TIMEOUT_SECONDS = 600
+RESOLUTION_WAIT_SECONDS = 10
+RESOLUTION_TIMEOUT_SECONDS = 300
 OPENING_PRICE_MAX_AGE = 30
+
+_force_wallet_refresh = False
+
+WALLET_REFRESH_SECONDS = 15
 
 
 def _handle_signal(signum, frame):
@@ -174,7 +178,34 @@ class RoundTracker:
             self._traded.discard(k)
 
 
+def _refresh_wallet(force_increase: bool = False):
+    """Fetch on-chain balances and sync bankroll. Returns True on success."""
+    try:
+        wb = fetch_wallet_balances()
+        sync_bankroll_to_balance(wb["usdc"])
+        br = get_bankroll()
+        dashboard.update_wallet(wb["address"], wb["usdc"], wb["pol"],
+                                bankroll=br.current_balance)
+        return True
+    except Exception as e:
+        log.debug("Wallet balance fetch failed: %s", e)
+        return False
+
+
+def _on_redeem_complete(condition_id: str, success: bool):
+    """Callback fired by background redeem thread when tx confirms."""
+    global _force_wallet_refresh
+    if success:
+        log.info("Redeem confirmed for %s — flagging wallet refresh", condition_id[:12])
+        _force_wallet_refresh = True
+    else:
+        log.warning("Redeem failed for %s — flagging wallet refresh anyway", condition_id[:12])
+        _force_wallet_refresh = True
+
+
 def main_loop():
+    global _force_wallet_refresh
+
     tracker = RoundTracker()
     pending_trades: list[PendingTrade] = []
     cycle = 0
@@ -187,8 +218,19 @@ def main_loop():
     ws.start()
     log.info("WebSocket market data client started")
 
-    _wallet_refresh_interval = 30
-    _last_wallet_cycle = -_wallet_refresh_interval
+    set_redeem_callback(_on_redeem_complete)
+
+    _ws_resolutions: list[tuple[str, str]] = []
+    _ws_res_lock = __import__("threading").Lock()
+
+    def _on_ws_resolution(condition_id: str, winning_outcome: str):
+        with _ws_res_lock:
+            _ws_resolutions.append((condition_id, winning_outcome))
+        log.info("WS resolution event queued: %s -> %s", condition_id[:12], winning_outcome)
+
+    ws.set_resolution_callback(_on_ws_resolution)
+
+    _last_wallet_refresh_time = 0.0
 
     while not _shutdown:
         cycle += 1
@@ -197,24 +239,29 @@ def main_loop():
         allowed, risk_reason = risk.pre_trade_check()
         dashboard.update_risk_stats(risk.stats_summary())
 
-        if cycle - _last_wallet_cycle >= _wallet_refresh_interval:
-            _last_wallet_cycle = cycle
-            try:
-                wb = fetch_wallet_balances()
-                sync_bankroll_to_balance(wb["usdc"])
-                br = get_bankroll()
-                dashboard.update_wallet(wb["address"], wb["usdc"], wb["pol"],
-                                        bankroll=br.current_balance)
-            except Exception as e:
-                log.debug("Wallet balance fetch failed: %s", e)
+        now = time.time()
+        if _force_wallet_refresh or (now - _last_wallet_refresh_time) >= WALLET_REFRESH_SECONDS:
+            _force_wallet_refresh = False
+            _last_wallet_refresh_time = now
+            _refresh_wallet()
 
         log.info(
             "-- Cycle %d  [trades: %d | pending: %d] -------------------------",
             cycle, trade_count, len(pending_trades),
         )
 
+        # ── Phase 0.5: process any WebSocket resolution events ──
+        with _ws_res_lock:
+            ws_events = list(_ws_resolutions)
+            _ws_resolutions.clear()
+        if ws_events:
+            _apply_ws_resolutions(ws_events, pending_trades, tracker)
+
         # ── Phase 1: resolve pending trades whose rounds have ended ──
+        had_pending = len(pending_trades)
         _resolve_pending_trades(pending_trades, tracker)
+        if len(pending_trades) < had_pending:
+            _force_wallet_refresh = True
 
         # ── Phase 1b: check matching engine restart window ──
         from src.http_client import is_engine_restart_window, engine_restart_status
@@ -407,6 +454,19 @@ def main_loop():
         _print_status(cycle, rounds, pending_trades)
         dashboard.update_risk_stats(risk.stats_summary())
 
+        # ── Phase 5: second resolve pass — catch trades that ended during this cycle ──
+        if pending_trades:
+            pre_count = len(pending_trades)
+            _resolve_pending_trades(pending_trades, tracker)
+            if len(pending_trades) < pre_count:
+                _force_wallet_refresh = True
+
+        # ── Phase 5b: if redeem completed during this cycle, refresh wallet now ──
+        if _force_wallet_refresh:
+            _force_wallet_refresh = False
+            _last_wallet_refresh_time = time.time()
+            _refresh_wallet()
+
         sleep_time = _calculate_sleep(rounds, pending_trades)
         log.debug("Sleeping %.1fs until next check", sleep_time)
         _sleep(sleep_time)
@@ -454,10 +514,9 @@ def _resolve_pending_trades(
 
         outcome = check_round_resolution(trade.event_slug)
 
-        if outcome is None and now > trade.round_end_timestamp + 300:
+        if outcome is None and now > trade.round_end_timestamp + 120:
             log.warning(
-                "Gamma API not resolving %s after 5min — trying Chainlink fallback "
-                "(UNRELIABLE: compares current price, not close price)",
+                "Gamma API not resolving %s after 2min — trying Chainlink fallback",
                 trade.condition_id[:12],
             )
             outcome = _chainlink_fallback_resolution(trade)
@@ -484,6 +543,38 @@ def _resolve_pending_trades(
         won = outcome == trade.direction
         _record_resolution(trade, won=won, outcome=outcome)
         resolved.append(trade)
+
+    for trade in resolved:
+        pending_trades.remove(trade)
+
+
+def _apply_ws_resolutions(
+    ws_events: list[tuple[str, str]],
+    pending_trades: list[PendingTrade],
+    tracker: RoundTracker,
+):
+    """
+    Instantly resolve pending trades using WebSocket market_resolved events,
+    skipping the Gamma API polling delay entirely.
+    """
+    if not ws_events or not pending_trades:
+        return
+
+    resolved: list[PendingTrade] = []
+    for condition_id, winning_outcome in ws_events:
+        outcome = winning_outcome.lower()
+        if outcome not in ("up", "down"):
+            continue
+        for trade in pending_trades:
+            if trade.condition_id == condition_id or condition_id.endswith(trade.condition_id):
+                won = outcome == trade.direction
+                log.info(
+                    "INSTANT WS resolution for %s: outcome=%s (trade=%s) -> %s",
+                    condition_id[:12], outcome, trade.direction, "WIN" if won else "LOSS",
+                )
+                _record_resolution(trade, won=won, outcome=outcome)
+                resolved.append(trade)
+                break
 
     for trade in resolved:
         pending_trades.remove(trade)
@@ -527,9 +618,9 @@ def _record_resolution(trade: PendingTrade, won: bool, outcome: str):
         try:
             tx = redeem_winning_position(trade.condition_id, neg_risk=trade.neg_risk)
             if tx:
-                log.info("Redeemed winnings for %s: tx=%s", trade.condition_id[:12], tx)
+                log.info("Redeem tx broadcast for %s: %s (confirming in background)", trade.condition_id[:12], tx)
             else:
-                log.warning("Redeem returned None for %s", trade.condition_id[:12])
+                log.warning("Redeem broadcast returned None for %s", trade.condition_id[:12])
         except Exception as e:
             log.warning("Auto-redeem failed for %s: %s", trade.condition_id[:12], e)
     else:
@@ -603,7 +694,11 @@ def _calculate_sleep(
 ) -> float:
     """Smart sleep: wake up when the nearest round enters our entry window
     or when a pending trade might be ready for resolution."""
-    min_sleep = 10.0
+    global _force_wallet_refresh
+    min_sleep = 8.0
+
+    if _force_wallet_refresh:
+        return 1.0
 
     if rounds:
         nearest = min(r.seconds_remaining for r in rounds)
@@ -620,7 +715,7 @@ def _calculate_sleep(
             time_until_check = (pt.round_end_timestamp + RESOLUTION_WAIT_SECONDS) - now
             if time_until_check <= 0:
                 return 1.0
-            min_sleep = min(min_sleep, time_until_check + 1)
+            min_sleep = min(min_sleep, max(1.0, time_until_check))
 
     return max(1.0, min_sleep)
 
