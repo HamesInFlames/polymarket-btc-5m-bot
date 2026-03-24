@@ -25,7 +25,7 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
 from py_clob_client.order_builder.constants import BUY, SELL
 
-from src.config import CLOB_HOST, CHAIN_ID, PRIVATE_KEY, LIVE_TRADING
+from src.config import CLOB_HOST, CHAIN_ID, PRIVATE_KEY, LIVE_TRADING, RELAYER_API_KEY
 
 log = logging.getLogger(__name__)
 
@@ -75,6 +75,13 @@ def get_client() -> ClobClient:
         signature_type=0,
         funder=wallet_address,
     )
+
+    if RELAYER_API_KEY:
+        log.info(
+            "Relayer API key found but not used — EOA wallets (signature_type=0) "
+            "cannot use the relayer. To enable gasless transactions, upgrade to a "
+            "proxy or safe wallet."
+        )
 
     log.info("CLOB client initialized for wallet %s", wallet_address)
     return _client
@@ -126,6 +133,11 @@ def place_buy_order(
         client = get_client()
         ot = _parse_order_type(order_type)
 
+        order_options = PartialCreateOrderOptions(
+            tick_size=tick_size,
+            neg_risk=neg_risk,
+        )
+
         signed_order = client.create_order(
             OrderArgs(
                 token_id=token_id,
@@ -133,17 +145,20 @@ def place_buy_order(
                 size=size,
                 side=BUY,
             ),
-            options=PartialCreateOrderOptions(
-                tick_size=tick_size,
-                neg_risk=neg_risk,
-            ),
+            options=order_options,
         )
         resp = client.post_order(signed_order, orderType=ot)
 
         return _parse_fill_result(resp, requested_size=size, limit_price=price)
 
     except Exception as e:
-        log.error("Order placement failed: %s", e)
+        error_str = str(e)
+        if "425" in error_str or "Too Early" in error_str:
+            log.warning("Matching engine restarting (425) — order not placed")
+            from src.http_client import _signal_engine_restart
+            _signal_engine_restart()
+        else:
+            log.error("Order placement failed: %s", e)
         return FillResult(
             success=False,
             order_id="",

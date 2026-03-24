@@ -1,13 +1,19 @@
 """
-Risk Manager (v3) — Stats-Only, No Restrictions
--------------------------------------------------
-Tracks P&L and trade statistics. No pausing, no limits, no blocking.
-Kelly Criterion is the only risk governor — every profit reinvests.
+Risk Manager (v4) — Enforced Limits
+-------------------------------------
+Tracks P&L and trade statistics AND enforces daily loss limits and
+consecutive loss limits. When a limit is hit, trading is paused until
+conditions improve (new day for daily loss, a win for consecutive losses).
+
+Kelly Criterion remains the primary sizing governor; this module acts
+as a circuit breaker for catastrophic streaks.
 """
 
 import logging
 import time
 from dataclasses import dataclass, field
+
+from src.config import MAX_DAILY_LOSS, MAX_CONSECUTIVE_LOSSES
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +38,8 @@ class TradeRecord:
 class RiskManager:
     _trades: list = field(default_factory=list)
     _day_start: float = field(default_factory=time.time)
+    _paused: bool = False
+    _pause_reason: str = ""
 
     def record_trade(self, trade: TradeRecord):
         self._trades.append(trade)
@@ -48,6 +56,7 @@ class RiskManager:
             t.won = won
             t.pnl = pnl
             log.info("Result: %s PnL=$%.4f", "WIN" if won else "LOSS", pnl)
+        self._check_limits()
 
     def record_pnl(self, won: bool, pnl: float, direction: str = "",
                    bet_dollars: float = 0.0, kelly_fraction: float = 0.0,
@@ -68,11 +77,59 @@ class RiskManager:
         )
         self._trades.append(rec)
         log.info("Result: %s PnL=$%.4f", "WIN" if won else "LOSS", pnl)
+        self._check_limits()
 
     def pre_trade_check(self) -> tuple[bool, str]:
-        """Always allows trading — no restrictions."""
+        """
+        Returns (allowed, reason). If limits are breached, returns False
+        with a human-readable explanation. Called before every trade attempt.
+        """
         self._maybe_reset_day()
+        self._check_limits()
+
+        if self._paused:
+            log.warning("Trading PAUSED: %s", self._pause_reason)
+            return False, self._pause_reason
+
         return True, "OK"
+
+    def _check_limits(self):
+        """Evaluate risk limits and set/clear pause state."""
+        daily = self.daily_pnl()
+        consec = self.consecutive_losses()
+
+        if MAX_DAILY_LOSS > 0 and daily <= -MAX_DAILY_LOSS:
+            if not self._paused or "daily" not in self._pause_reason:
+                log.warning(
+                    "RISK LIMIT: Daily loss $%.2f exceeds max $%.2f — PAUSING",
+                    abs(daily), MAX_DAILY_LOSS,
+                )
+            self._paused = True
+            self._pause_reason = (
+                f"Daily loss ${abs(daily):.2f} >= limit ${MAX_DAILY_LOSS:.2f}"
+            )
+            return
+
+        if MAX_CONSECUTIVE_LOSSES > 0 and consec >= MAX_CONSECUTIVE_LOSSES:
+            if not self._paused or "consecutive" not in self._pause_reason:
+                log.warning(
+                    "RISK LIMIT: %d consecutive losses >= max %d — PAUSING",
+                    consec, MAX_CONSECUTIVE_LOSSES,
+                )
+            self._paused = True
+            self._pause_reason = (
+                f"{consec} consecutive losses >= limit {MAX_CONSECUTIVE_LOSSES}"
+            )
+            return
+
+        if self._paused:
+            log.info("Risk limits clear — RESUMING trading")
+            self._paused = False
+            self._pause_reason = ""
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
 
     def daily_pnl(self) -> float:
         return sum(
@@ -134,8 +191,8 @@ class RiskManager:
             "daily_pnl": self.daily_pnl(),
             "total_pnl": self.total_pnl(),
             "consecutive_losses": self.consecutive_losses(),
-            "paused": False,
-            "pause_reason": "",
+            "paused": self._paused,
+            "pause_reason": self._pause_reason,
             "profit_factor": self.profit_factor(),
             "avg_edge": self.avg_edge(),
             "avg_kelly": self.avg_kelly(),
@@ -152,3 +209,7 @@ class RiskManager:
                 ]),
             )
             self._day_start = now
+            if self._paused and "daily" in self._pause_reason.lower():
+                log.info("New day — clearing daily loss pause")
+                self._paused = False
+                self._pause_reason = ""

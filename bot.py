@@ -45,6 +45,10 @@ from src.risk_manager import RiskManager
 from src.trader import place_buy_order, FillResult
 from src.fees import effective_fee_rate
 from src.bot_state import state as dashboard, TradeEntry, install_log_handler
+from src.redeemer import redeem_winning_position, check_pol_balance
+from src.geoblock import assert_not_geoblocked, check_geoblock
+from src.ws_client import get_ws_client
+from src.data_api import reconcile_bankroll
 
 logging.basicConfig(
     level=logging.INFO,
@@ -100,6 +104,7 @@ class PendingTrade:
     entry_time: float
     round_end_timestamp: int
     is_live: bool
+    neg_risk: bool = False
     resolution_attempts: int = 0
 
 
@@ -173,11 +178,15 @@ def main_loop():
     mode = "LIVE" if LIVE_TRADING else "DRY RUN"
     dashboard.update_bot_status(True, 0, 0, 0, mode)
 
+    ws = get_ws_client()
+    ws.start()
+    log.info("WebSocket market data client started")
+
     while not _shutdown:
         cycle += 1
         dashboard.update_bot_status(True, cycle, trade_count, 0, mode)
 
-        risk.pre_trade_check()
+        allowed, risk_reason = risk.pre_trade_check()
         dashboard.update_risk_stats(risk.stats_summary())
 
         log.info(
@@ -187,6 +196,17 @@ def main_loop():
 
         # ── Phase 1: resolve pending trades whose rounds have ended ──
         _resolve_pending_trades(pending_trades, tracker)
+
+        # ── Phase 1b: check matching engine restart window ──
+        from src.http_client import is_engine_restart_window, engine_restart_status
+        engine_status = engine_restart_status()
+        if engine_status["active"] or is_engine_restart_window():
+            log.warning(
+                "Matching engine restart — skipping trading this cycle (cooldown=%.0fs)",
+                engine_status["cooldown_remaining_s"],
+            )
+            _sleep(10)
+            continue
 
         # ── Phase 2: fetch current BTC price ──
         try:
@@ -213,6 +233,13 @@ def main_loop():
         pending_ids = {p.condition_id for p in pending_trades}
         tracker.cleanup(active_ids, pending_ids)
 
+        # Subscribe to WebSocket for real-time price data on active tokens
+        ws_tokens = []
+        for r in rounds:
+            ws_tokens.extend([r.up_token_id, r.down_token_id])
+        if ws_tokens:
+            ws.subscribe(ws_tokens)
+
         log.info("Found %d active round(s)", len(rounds))
 
         # ── Phase 4: capture opening prices & trade eligible rounds ──
@@ -223,6 +250,10 @@ def main_loop():
             _capture_opening_price(tracker, rnd)
 
             if tracker.already_traded(rnd.condition_id):
+                continue
+
+            if not allowed:
+                log.info("Skipping trade — risk paused: %s", risk_reason)
                 continue
 
             remaining = rnd.seconds_remaining
@@ -292,6 +323,7 @@ def main_loop():
                     entry_time=time.time(),
                     round_end_timestamp=rnd.end_timestamp,
                     is_live=fill.is_live,
+                    neg_risk=sig.neg_risk,
                 )
                 pending_trades.append(pending)
 
@@ -347,6 +379,7 @@ def main_loop():
                 break
             _sleep(2)
 
+    ws.stop()
     dashboard.update_bot_status(False, cycle, trade_count, 0, mode)
     log.info("Bot shut down gracefully.")
     _print_final_stats(pending_trades)
@@ -597,6 +630,33 @@ def _print_final_stats(pending_trades: list[PendingTrade] | None = None):
 
 if __name__ == "__main__":
     print_banner()
+
+    # Verify outbound IP is not in a Polymarket-blocked region
+    try:
+        geo = assert_not_geoblocked()
+        print(f"   Geoblock:            PASSED (IP: {geo['ip']} | {geo['region']})")
+        print("=" * 62)
+        print()
+    except RuntimeError as e:
+        print()
+        print("!" * 62)
+        print(str(e))
+        print("!" * 62)
+        print()
+        sys.exit(1)
+
+    # Reconcile on-chain positions with internal state
+    try:
+        recon = reconcile_bankroll()
+        if recon.get("estimated_value_usd") is not None:
+            print(f"   On-chain positions: {recon['open_positions']} open (${recon['estimated_value_usd']:.2f} est. value)")
+        else:
+            print(f"   On-chain positions: {recon.get('open_positions', '?')} open")
+        print("=" * 62)
+        print()
+    except Exception as e:
+        log.warning("Position reconciliation failed: %s", e)
+
     try:
         main_loop()
     except KeyboardInterrupt:

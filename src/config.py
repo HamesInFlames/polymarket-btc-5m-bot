@@ -36,6 +36,10 @@ NEG_RISK_CTF_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
 # Chainlink BTC/USD aggregator on Polygon
 CHAINLINK_BTC_USD = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
 
+# ── Relayer / Redemption ─────────────────────────────────────
+RELAYER_API_KEY: str = os.getenv("RELAYER_API_KEY", "")
+RELAYER_API_KEY_ADDRESS: str = os.getenv("RELAYER_API_KEY_ADDRESS", "")
+
 # ── Trading parameters ────────────────────────────────────────
 MIN_EDGE: float = _float("MIN_EDGE", 0.05)
 ENTRY_WINDOW_START: int = _int("ENTRY_WINDOW_START", 180)

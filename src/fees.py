@@ -18,6 +18,7 @@ from typing import Optional
 import requests
 
 from src.config import CLOB_HOST
+from src.http_client import resilient_get
 
 log = logging.getLogger(__name__)
 
@@ -65,7 +66,7 @@ def net_profit_per_contract(price: float, win: bool) -> float:
 def fetch_fee_rate_bps(token_id: str) -> Optional[int]:
     """Fetch the fee rate in basis points from the CLOB for a specific token."""
     try:
-        resp = requests.get(
+        resp = resilient_get(
             f"{CLOB_HOST}/fee-rate",
             params={"token_id": token_id},
             timeout=5,

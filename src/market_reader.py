@@ -26,6 +26,9 @@ from typing import Optional
 import requests
 
 from src.config import GAMMA_HOST, CLOB_HOST
+from src.http_client import resilient_get
+
+WS_DATA_MAX_AGE = 5  # use WS data if updated within this many seconds
 
 log = logging.getLogger(__name__)
 
@@ -86,7 +89,7 @@ def _fetch_round(start_ts: int) -> Optional[MarketRound]:
     slug = f"btc-updown-5m-{start_ts}"
 
     try:
-        resp = requests.get(
+        resp = resilient_get(
             f"{GAMMA_HOST}/events/slug/{slug}",
             timeout=8,
         )
@@ -174,7 +177,8 @@ def _fetch_round(start_ts: int) -> Optional[MarketRound]:
 
 def get_full_market_data(token_id: str) -> dict:
     """
-    Fetch comprehensive market data from ALL relevant CLOB endpoints.
+    Fetch comprehensive market data, preferring WebSocket state when fresh.
+    Falls back to REST endpoints when WS data is unavailable or stale.
 
     Returns:
         {
@@ -194,6 +198,39 @@ def get_full_market_data(token_id: str) -> dict:
             "display_price": float,  # what Polymarket shows (mid or last_trade)
         }
     """
+    # Try WebSocket state first (faster, no HTTP call)
+    try:
+        from src.ws_client import get_ws_client
+        ws_state = get_ws_client().get_state(token_id)
+        if ws_state and (time.time() - ws_state.updated_at) < WS_DATA_MAX_AGE:
+            log.debug("Using WebSocket data for %s (%.1fs old)", token_id[:16],
+                       time.time() - ws_state.updated_at)
+            fee_bps = _fetch_fee_rate(token_id)
+            book = _fetch_order_book(token_id)
+            min_order_size = float(book.get("min_order_size", 5)) if book else 5.0
+            tick_size = book.get("tick_size", "0.01") if book else "0.01"
+            neg_risk = book.get("neg_risk", False) if book else False
+
+            display_price = ws_state.mid if ws_state.spread <= 0.10 else ws_state.last_trade_price
+            return {
+                "best_bid": ws_state.best_bid,
+                "best_ask": ws_state.best_ask,
+                "mid": ws_state.mid,
+                "spread": ws_state.spread,
+                "last_trade_price": ws_state.last_trade_price,
+                "last_trade_side": ws_state.last_trade_side,
+                "min_order_size": min_order_size,
+                "tick_size": tick_size,
+                "neg_risk": neg_risk,
+                "fee_rate_bps": fee_bps,
+                "bid_depth": ws_state.bid_depth,
+                "ask_depth": ws_state.ask_depth,
+                "book_levels": 0,
+                "display_price": display_price,
+            }
+    except Exception:
+        pass
+
     result = {
         "best_bid": 0.0,
         "best_ask": 1.0,
@@ -299,7 +336,7 @@ def get_order_book_prices(token_id: str) -> dict:
 def _fetch_order_book(token_id: str) -> Optional[dict]:
     """GET /book?token_id=X"""
     try:
-        resp = requests.get(
+        resp = resilient_get(
             f"{CLOB_HOST}/book",
             params={"token_id": token_id},
             timeout=5,
@@ -314,7 +351,7 @@ def _fetch_order_book(token_id: str) -> Optional[dict]:
 def _fetch_midpoint(token_id: str) -> Optional[float]:
     """GET /midpoint?token_id=X — returns the average of best bid and best ask."""
     try:
-        resp = requests.get(
+        resp = resilient_get(
             f"{CLOB_HOST}/midpoint",
             params={"token_id": token_id},
             timeout=5,
@@ -331,7 +368,7 @@ def _fetch_midpoint(token_id: str) -> Optional[float]:
 def _fetch_spread(token_id: str) -> Optional[float]:
     """GET /spread?token_id=X — returns the difference between best ask and best bid."""
     try:
-        resp = requests.get(
+        resp = resilient_get(
             f"{CLOB_HOST}/spread",
             params={"token_id": token_id},
             timeout=5,
@@ -347,7 +384,7 @@ def _fetch_spread(token_id: str) -> Optional[float]:
 def _fetch_last_trade_price(token_id: str) -> Optional[dict]:
     """GET /last-trade-price?token_id=X — returns {price, side}."""
     try:
-        resp = requests.get(
+        resp = resilient_get(
             f"{CLOB_HOST}/last-trade-price",
             params={"token_id": token_id},
             timeout=5,
@@ -365,7 +402,7 @@ def _fetch_last_trade_price(token_id: str) -> Optional[dict]:
 def _fetch_market_price(token_id: str, side: str) -> Optional[float]:
     """GET /price?token_id=X&side=BUY|SELL — returns the best price for that side."""
     try:
-        resp = requests.get(
+        resp = resilient_get(
             f"{CLOB_HOST}/price",
             params={"token_id": token_id, "side": side},
             timeout=5,
@@ -389,7 +426,7 @@ def _fetch_fee_rate(token_id: str) -> int:
         return cached[0]
 
     try:
-        resp = requests.get(
+        resp = resilient_get(
             f"{CLOB_HOST}/fee-rate",
             params={"token_id": token_id},
             timeout=5,
@@ -408,7 +445,7 @@ def _fetch_fee_rate(token_id: str) -> int:
 def _fetch_tick_size(token_id: str) -> Optional[str]:
     """GET /tick-size?token_id=X — returns minimum price increment."""
     try:
-        resp = requests.get(
+        resp = resilient_get(
             f"{CLOB_HOST}/tick-size",
             params={"token_id": token_id},
             timeout=5,
@@ -444,7 +481,7 @@ def check_round_resolution(event_slug: str) -> Optional[str]:
         None   – not yet resolved (or fetch failed)
     """
     try:
-        resp = requests.get(
+        resp = resilient_get(
             f"{GAMMA_HOST}/events/slug/{event_slug}",
             timeout=8,
         )

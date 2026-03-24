@@ -52,7 +52,7 @@ from src.kelly import (
     load_bankroll,
     save_bankroll,
 )
-from src.fees import effective_fee_rate, calculate_crypto_fee
+from src.fees import effective_fee_rate, calculate_crypto_fee, fetch_fee_rate_bps
 
 log = logging.getLogger(__name__)
 
@@ -183,7 +183,16 @@ def evaluate_round(
         return None
 
     # --- Calculate fee-adjusted edge ---
-    fee_rate = effective_fee_rate(limit_price)
+    # Try dynamic fee from CLOB endpoint first; fall back to hardcoded formula
+    live_bps = market.get("fee_rate_bps", 0)
+    if live_bps and live_bps > 0:
+        fee_rate = (live_bps / 10_000.0) * (limit_price * (1 - limit_price))
+    else:
+        clob_bps = fetch_fee_rate_bps(token_id)
+        if clob_bps is not None and clob_bps > 0:
+            fee_rate = (clob_bps / 10_000.0) * (limit_price * (1 - limit_price))
+        else:
+            fee_rate = effective_fee_rate(limit_price)
     eff_price = limit_price / (1.0 - fee_rate) if fee_rate < 1.0 else limit_price
 
     edge = win_prob - eff_price
