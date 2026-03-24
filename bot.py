@@ -46,7 +46,12 @@ from src.trader import place_buy_order, FillResult
 from src.fees import effective_fee_rate
 from src.bot_state import state as dashboard, TradeEntry, install_log_handler
 from src.redeemer import redeem_winning_position, check_pol_balance, fetch_wallet_balances
-from src.geoblock import assert_not_geoblocked, check_geoblock
+from src.geoblock import (
+    assert_not_geoblocked, check_geoblock,
+    is_clob_geoblocked, clob_geoblock_status,
+    probe_clob_trading, clear_clob_geoblock, signal_clob_geoblock,
+    SAFE_COUNTRIES,
+)
 from src.ws_client import get_ws_client
 from src.data_api import reconcile_bankroll
 
@@ -218,6 +223,28 @@ def main_loop():
             )
             _sleep(10)
             continue
+
+        # ── Phase 1c: check CLOB geoblock circuit breaker ──
+        if is_clob_geoblocked():
+            geo_status = clob_geoblock_status()
+            log.warning(
+                "CLOB geoblocked — skipping trading (re-check in %.0fs). "
+                "Switch VPN to: %s",
+                geo_status["seconds_until_recheck"],
+                ", ".join(SAFE_COUNTRIES[:4]),
+            )
+            _sleep(min(30, geo_status["seconds_until_recheck"] + 1))
+            continue
+        elif clob_geoblock_status()["blocked"]:
+            log.info("Re-probing CLOB after geoblock cooldown...")
+            if probe_clob_trading():
+                clear_clob_geoblock()
+                log.info("CLOB probe succeeded — resuming trading")
+            else:
+                signal_clob_geoblock()
+                log.warning("CLOB still geoblocked — waiting another cycle")
+                _sleep(30)
+                continue
 
         # ── Phase 2: fetch current BTC price ──
         try:

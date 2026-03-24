@@ -26,6 +26,7 @@ from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOp
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from src.config import CLOB_HOST, CHAIN_ID, PRIVATE_KEY, LIVE_TRADING, RELAYER_API_KEY
+from src.geoblock import signal_clob_geoblock
 
 log = logging.getLogger(__name__)
 
@@ -155,11 +156,11 @@ def place_buy_order(
         error_str = str(e)
         lower_err = error_str.lower()
         if "403" in error_str and ("region" in lower_err or "restricted" in lower_err or "geoblock" in lower_err):
+            signal_clob_geoblock()
             log.critical(
                 "GEOBLOCKED by Polymarket CLOB! Order rejected with 403.\n"
-                "  Your VPN IP is blocked at the TRADING level.\n"
-                "  Switch NordVPN to: Portugal, Germany, Poland, Singapore, etc.\n"
-                "  Canada (all), US, UK, Australia, France are blocked.\n"
+                "  Trading paused — will re-check in 120s.\n"
+                "  Switch VPN to: Norway, Sweden, Finland, Denmark, Switzerland.\n"
                 "  Error: %s", error_str[:300],
             )
             return FillResult(
