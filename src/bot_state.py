@@ -64,6 +64,14 @@ class BotState:
         self.wallet_updated_at: float = 0.0
         self.bankroll: float = 0.0
 
+        self.bankroll_starting: float = 0.0
+        self.bankroll_peak: float = 0.0
+        self.bankroll_num_bets: int = 0
+        self.bankroll_num_wins: int = 0
+        self.bankroll_total_wagered: float = 0.0
+        self.bankroll_max_drawdown: float = 0.0
+        self.equity_history: list[dict] = []
+
     def update_bot_status(self, running: bool, cycle: int, trade_count: int,
                           max_trades: int, mode: str):
         with self._lock:
@@ -138,6 +146,23 @@ class BotState:
             self.wallet_updated_at = time.time()
             if bankroll is not None:
                 self.bankroll = bankroll
+                now = time.time()
+                last = self.equity_history[-1] if self.equity_history else None
+                if not last or abs(last["balance"] - bankroll) > 0.001 or now - last["ts"] > 30:
+                    self.equity_history.append({"ts": now, "balance": bankroll})
+                    if len(self.equity_history) > 500:
+                        self.equity_history = self.equity_history[-500:]
+
+    def update_bankroll_meta(self, starting: float, peak: float,
+                             num_bets: int, num_wins: int,
+                             total_wagered: float, max_drawdown: float):
+        with self._lock:
+            self.bankroll_starting = starting
+            self.bankroll_peak = peak
+            self.bankroll_num_bets = num_bets
+            self.bankroll_num_wins = num_wins
+            self.bankroll_total_wagered = total_wagered
+            self.bankroll_max_drawdown = max_drawdown
 
     def set_error(self, error: str):
         with self._lock:
@@ -211,6 +236,16 @@ class BotState:
                     "bankroll": self.bankroll,
                     "updated_at": self.wallet_updated_at,
                 },
+                "bankroll_meta": {
+                    "starting": self.bankroll_starting,
+                    "current": self.bankroll,
+                    "peak": self.bankroll_peak,
+                    "num_bets": self.bankroll_num_bets,
+                    "num_wins": self.bankroll_num_wins,
+                    "total_wagered": self.bankroll_total_wagered,
+                    "max_drawdown": self.bankroll_max_drawdown,
+                },
+                "equity_history": list(self.equity_history[-200:]),
                 "error": {
                     "message": self.last_error,
                     "at": self.last_error_at,

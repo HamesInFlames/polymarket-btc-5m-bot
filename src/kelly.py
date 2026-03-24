@@ -1,6 +1,6 @@
 """
-Kelly Criterion Engine for Binary Polymarket Bets
-==================================================
+Kelly Criterion Engine for Binary Polymarket Bets (v2)
+======================================================
 For a binary contract paying $1.00 on win:
   - Cost per contract: p  (the market price you pay)
   - Profit if win:     1 - p
@@ -9,8 +9,13 @@ For a binary contract paying $1.00 on win:
 
 Full Kelly fraction:  f* = (win_prob - price) / (1 - price)
 
-This is the GROWTH-RATE OPTIMAL bet size as a fraction of bankroll.
-We apply fractional Kelly (configurable) to reduce variance.
+NEW in v2:
+  - Ruin-calibrated Kelly: auto-finds the largest fractional Kelly
+    multiplier that keeps risk-of-ruin below a user-defined target.
+  - Fee-aware Kelly: feeds the effective (post-fee) price into the
+    Kelly formula so the edge and sizing are consistent.
+  - Bankroll drawdown tracking with max-drawdown field.
+  - Bet quality grade (A/B/C/D) based on edge, Kelly, and growth rate.
 """
 
 import json
@@ -31,23 +36,25 @@ BANKROLL_FILE = Path(__file__).resolve().parent.parent / "data" / "bankroll.json
 class BetRecommendation:
     """Output of the Kelly engine for a single opportunity."""
     should_bet: bool
-    kelly_fraction: float       # raw Kelly fraction of bankroll
-    adj_kelly_fraction: float   # after fractional Kelly multiplier
-    bet_dollars: float          # actual dollars to wager
-    num_contracts: float        # bet_dollars / contract_price
-    expected_value: float       # EV per dollar risked
-    expected_profit: float      # EV in absolute dollars
-    growth_rate: float          # expected log-growth of bankroll
+    kelly_fraction: float
+    adj_kelly_fraction: float
+    bet_dollars: float
+    num_contracts: float
+    expected_value: float
+    expected_profit: float
+    growth_rate: float
     win_prob: float
     contract_price: float
-    edge: float                 # win_prob - contract_price
+    edge: float
     bankroll: float
     reason: str
+    ruin_prob: float = 0.0
+    quality_grade: str = ""
 
 
 @dataclass
 class Bankroll:
-    """Persistent bankroll tracker."""
+    """Persistent bankroll tracker with drawdown analytics."""
     starting_balance: float
     current_balance: float
     peak_balance: float
@@ -56,6 +63,7 @@ class Bankroll:
     total_lost: float = 0.0
     num_bets: int = 0
     num_wins: int = 0
+    max_drawdown: float = 0.0
     last_updated: float = field(default_factory=time.time)
 
     @property
@@ -80,6 +88,12 @@ class Bankroll:
             return 0.0
         return self.num_wins / self.num_bets
 
+    @property
+    def avg_bet(self) -> float:
+        if self.num_bets == 0:
+            return 0.0
+        return self.total_wagered / self.num_bets
+
     def record_win(self, wager: float, payout: float):
         profit = payout - wager
         self.current_balance += profit
@@ -88,6 +102,7 @@ class Bankroll:
         self.num_bets += 1
         self.num_wins += 1
         self.peak_balance = max(self.peak_balance, self.current_balance)
+        self.max_drawdown = max(self.max_drawdown, self.drawdown)
         self.last_updated = time.time()
 
     def record_loss(self, wager: float):
@@ -95,6 +110,7 @@ class Bankroll:
         self.total_wagered += wager
         self.total_lost += wager
         self.num_bets += 1
+        self.max_drawdown = max(self.max_drawdown, self.drawdown)
         self.last_updated = time.time()
 
     def to_dict(self) -> dict:
@@ -107,6 +123,7 @@ class Bankroll:
             "total_lost": self.total_lost,
             "num_bets": self.num_bets,
             "num_wins": self.num_wins,
+            "max_drawdown": self.max_drawdown,
             "last_updated": self.last_updated,
         }
 
@@ -121,8 +138,9 @@ def load_bankroll(starting_balance: float) -> Bankroll:
             data = json.loads(BANKROLL_FILE.read_text())
             br = Bankroll.from_dict(data)
             log.info(
-                "Loaded bankroll: $%.2f (started $%.2f, peak $%.2f)",
+                "Loaded bankroll: $%.2f (started $%.2f, peak $%.2f, max_dd %.1f%%)",
                 br.current_balance, br.starting_balance, br.peak_balance,
+                br.max_drawdown * 100,
             )
             return br
     except Exception as e:
@@ -151,17 +169,25 @@ def kelly_criterion(
     bankroll: float,
     kelly_multiplier: float = 1.0,
     min_bet_dollars: float = 0.50,
+    ruin_target: float = 0.05,
+    ruin_level: float = 0.1,
 ) -> BetRecommendation:
     """
     Calculate the optimal bet for a binary Polymarket contract.
-    UNRESTRICTED — Kelly decides the fraction, entire bankroll compounds.
+
+    Uses the full Kelly formula with optional ruin-calibrated cap:
+    if the requested kelly_multiplier would produce a risk-of-ruin
+    above ruin_target, the multiplier is reduced automatically.
 
     Args:
         win_prob:           Estimated probability of winning (0-1)
-        contract_price:     Market price of the contract (0-1)
-        bankroll:           Current bankroll in dollars (all profits reinvested)
-        kelly_multiplier:   Fraction of Kelly to use (1.0 = full Kelly)
+        contract_price:     Market price of the contract (0-1), should be
+                            fee-adjusted (effective price) for consistency
+        bankroll:           Current bankroll in dollars
+        kelly_multiplier:   Maximum fraction of Kelly to use
         min_bet_dollars:    Minimum bet to bother placing
+        ruin_target:        Maximum acceptable risk of ruin (0-1)
+        ruin_level:         What fraction of bankroll counts as "ruin"
 
     Returns:
         BetRecommendation with all sizing details
@@ -187,19 +213,25 @@ def kelly_criterion(
         no_bet.edge = edge
         return no_bet
 
-    # f* = (win_prob - price) / (1 - price)  — the growth-rate optimal fraction
     kelly_f = edge / (1.0 - contract_price)
 
-    adj_f = kelly_f * kelly_multiplier
+    # Ruin-calibrate: find largest multiplier <= kelly_multiplier
+    # such that risk_of_ruin stays below ruin_target
+    adj_mult = _calibrate_multiplier(
+        win_prob, contract_price, kelly_f,
+        max_mult=kelly_multiplier,
+        ruin_target=ruin_target,
+        ruin_level=ruin_level,
+    )
+    adj_f = kelly_f * adj_mult
 
-    # No caps — Kelly fraction is the ONLY governor
     bet_dollars = bankroll * adj_f
     bet_dollars = max(0.0, bet_dollars)
 
     if bet_dollars < min_bet_dollars:
         no_bet.reason = (
             f"Bet ${bet_dollars:.2f} below minimum ${min_bet_dollars:.2f} "
-            f"(kelly_f={kelly_f:.4f}, adj={adj_f:.4f})"
+            f"(kelly_f={kelly_f:.4f}, adj={adj_f:.4f}, mult={adj_mult:.3f})"
         )
         no_bet.edge = edge
         no_bet.kelly_fraction = kelly_f
@@ -210,11 +242,10 @@ def kelly_criterion(
     ev_per_dollar = edge / contract_price
     ev_absolute = edge * num_contracts
 
-    if win_prob > 0 and win_prob < 1:
-        g = (win_prob * math.log(1 + adj_f * (1 - contract_price) / contract_price)
-             + (1 - win_prob) * math.log(max(1e-10, 1 - adj_f)))
-    else:
-        g = 0.0
+    g = expected_growth_rate(win_prob, contract_price, adj_f)
+
+    ruin_p = risk_of_ruin(win_prob, contract_price, adj_f, ruin_level)
+    grade = _bet_quality_grade(edge, g, ruin_p)
 
     return BetRecommendation(
         should_bet=True,
@@ -229,12 +260,66 @@ def kelly_criterion(
         contract_price=contract_price,
         edge=edge,
         bankroll=bankroll,
+        ruin_prob=ruin_p,
+        quality_grade=grade,
         reason=(
-            f"Kelly={kelly_f:.4f} x{kelly_multiplier} -> {adj_f:.4f} of ${bankroll:.2f} = "
+            f"Kelly={kelly_f:.4f} x{adj_mult:.3f} -> {adj_f:.4f} of ${bankroll:.2f} = "
             f"${bet_dollars:.2f} ({num_contracts:.1f} contracts) "
-            f"EV=${ev_absolute:.4f} edge={edge:.4f}"
+            f"EV=${ev_absolute:.4f} edge={edge:.4f} "
+            f"ruin={ruin_p:.3f} grade={grade}"
         ),
     )
+
+
+def _calibrate_multiplier(
+    win_prob: float,
+    price: float,
+    kelly_f: float,
+    max_mult: float,
+    ruin_target: float,
+    ruin_level: float,
+) -> float:
+    """
+    Binary search for the largest multiplier in [0.01, max_mult] such that
+    the resulting risk_of_ruin <= ruin_target.
+
+    If even max_mult is safe, return max_mult unchanged.
+    If no multiplier is safe, return the smallest tested value.
+    """
+    if kelly_f <= 0 or max_mult <= 0:
+        return max_mult
+
+    ruin_at_max = risk_of_ruin(win_prob, price, kelly_f * max_mult, ruin_level)
+    if ruin_at_max <= ruin_target:
+        return max_mult
+
+    lo, hi = 0.01, max_mult
+    for _ in range(20):
+        mid = (lo + hi) / 2
+        r = risk_of_ruin(win_prob, price, kelly_f * mid, ruin_level)
+        if r <= ruin_target:
+            lo = mid
+        else:
+            hi = mid
+
+    return lo
+
+
+def _bet_quality_grade(edge: float, growth_rate: float, ruin_prob: float) -> str:
+    """
+    A simple quality grade:
+      A = strong edge, positive growth, low ruin
+      B = decent edge, positive growth
+      C = marginal edge
+      D = barely tradeable
+    """
+    if edge >= 0.08 and growth_rate > 0.001 and ruin_prob < 0.03:
+        return "A"
+    if edge >= 0.05 and growth_rate > 0.0005 and ruin_prob < 0.10:
+        return "B"
+    if edge >= 0.03 and growth_rate > 0:
+        return "C"
+    return "D"
 
 
 def expected_growth_rate(win_prob: float, price: float, fraction: float) -> float:
@@ -253,29 +338,90 @@ def expected_growth_rate(win_prob: float, price: float, fraction: float) -> floa
     return win_term + lose_term
 
 
-def risk_of_ruin(win_prob: float, price: float, bet_fraction: float, ruin_level: float = 0.1) -> float:
+def risk_of_ruin(
+    win_prob: float,
+    price: float,
+    bet_fraction: float,
+    ruin_level: float = 0.1,
+) -> float:
     """
-    Approximate probability of bankroll dropping to `ruin_level` fraction
-    of current bankroll before doubling.
+    Probability of bankroll dropping to `ruin_level` fraction of current
+    bankroll before doubling.
 
-    Uses the gambler's ruin approximation for biased random walks.
+    Uses the gambler's ruin approximation for biased random walks on
+    a multiplicative bankroll process:
+
+      After a win  the bankroll is multiplied by (1 + f*b)
+      After a loss the bankroll is multiplied by (1 - f)
+
+    where f = bet_fraction and b = (1-price)/price (net odds).
+
+    We convert to an additive random walk in log-space and apply
+    the classical formula P(ruin before target) for a walk with
+    drift mu and step sigma.
     """
-    if win_prob <= 0.5 or bet_fraction <= 0:
+    if bet_fraction <= 0 or win_prob <= 0 or price <= 0 or price >= 1:
         return 1.0
 
-    odds = (1.0 - price) / price
-    q = 1 - win_prob
-    ratio = q / (win_prob * odds) if (win_prob * odds) > 0 else 1.0
+    b = (1.0 - price) / price
+    win_mult = 1.0 + bet_fraction * b
+    lose_mult = 1.0 - bet_fraction
 
-    if abs(ratio - 1.0) < 1e-6:
-        return 0.5
+    if lose_mult <= 0:
+        return 1.0
 
-    n_steps_to_ruin = -math.log(ruin_level) / bet_fraction
-    n_steps_to_double = math.log(2) / bet_fraction
+    log_win = math.log(win_mult)
+    log_lose = math.log(lose_mult)
+
+    mu = win_prob * log_win + (1 - win_prob) * log_lose
+    sigma2 = win_prob * log_win**2 + (1 - win_prob) * log_lose**2 - mu**2
+
+    if mu <= 0:
+        return 1.0
+    if sigma2 <= 0:
+        return 0.0
+
+    log_ruin = math.log(ruin_level)
+    log_target = math.log(2.0)
+
+    # Classical formula: P(hit ruin before target) in additive walk
+    # with drift mu, variance sigma^2 per step
+    # P = (exp(-2*mu*T/sigma^2) - 1) / (exp(-2*mu*R/sigma^2) - 1)
+    # where R = log(ruin_level), T = log(target)
+    # Simplified via the Wald approximation
+    lam = 2.0 * mu / sigma2
 
     try:
-        numerator = 1 - ratio ** n_steps_to_double
-        denominator = ratio ** (-n_steps_to_ruin) - ratio ** n_steps_to_double
-        return max(0.0, min(1.0, numerator / denominator)) if denominator != 0 else 0.5
+        exp_target = math.exp(-lam * log_target)
+        exp_ruin = math.exp(-lam * log_ruin)
+        p_ruin = (1.0 - exp_target) / (exp_ruin - exp_target)
+        return max(0.0, min(1.0, p_ruin))
     except (OverflowError, ZeroDivisionError):
-        return 0.01 if win_prob > 0.6 else 0.5
+        return 0.01 if mu > 0 else 0.5
+
+
+def optimal_kelly_for_ruin(
+    win_prob: float,
+    price: float,
+    max_ruin: float = 0.05,
+    ruin_level: float = 0.1,
+) -> float:
+    """
+    Find the largest fractional Kelly multiplier (0 to 1) such that
+    risk_of_ruin stays below max_ruin.
+
+    Useful for one-off calibration or display purposes.
+    """
+    kelly_f = (win_prob - price) / (1.0 - price)
+    if kelly_f <= 0:
+        return 0.0
+
+    lo, hi = 0.0, 1.0
+    for _ in range(30):
+        mid = (lo + hi) / 2
+        r = risk_of_ruin(win_prob, price, kelly_f * mid, ruin_level)
+        if r <= max_ruin:
+            lo = mid
+        else:
+            hi = mid
+    return lo

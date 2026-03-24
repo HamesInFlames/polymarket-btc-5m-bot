@@ -1,27 +1,26 @@
 """
-Historical Backtest with FULLY REAL Data
-=========================================
+Historical Backtest with FULLY REAL Data (v2)
+=============================================
 Everything in this backtest is real:
 
   1. BTC PRICES — fetched from Binance 1-minute klines (historical).
-     For each round we get the actual BTC price at round start (opening)
-     and at the bot's evaluation time (~2 min before close).
+  2. OUTCOMES — fetched from Polymarket's Gamma API.
+  3. STRATEGY DECISIONS — compares real BTC price at evaluation
+     to real opening price, exactly like the live bot.
+  4. FEES & SIZING — real Polymarket fee formula, ruin-calibrated Kelly.
 
-  2. OUTCOMES — fetched from Polymarket's Gamma API.  Each round's winner
-     (Up / Down) is the actual on-chain settlement.
-
-  3. STRATEGY DECISIONS — the bot compares real BTC price at evaluation
-     time to real opening price, exactly like it would live.  If BTC is
-     above opening → direction = "up", below → "down".
-
-  4. FEES & SIZING — real Polymarket fee formula, real Kelly criterion.
-
-The ONLY estimation is entry price (order book), since historical
-order book snapshots are not available.
+v2 additions:
+  - Feature vector collection per trade for model training.
+  - Logistic model weight optimiser (gradient-free Nelder-Mead).
+  - Risk-of-ruin estimate on the backtest equity curve.
+  - Sharpe / Sortino / Calmar ratios.
+  - Drawdown analysis.
+  - --train flag to optimise and save model weights.
 
 Usage:
     python tools/backtest_real.py
     python tools/backtest_real.py --hours 48 --bankroll 250 --save
+    python tools/backtest_real.py --hours 168 --train
 """
 
 import argparse
@@ -39,7 +38,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import GAMMA_HOST
 from src.fees import effective_fee_rate
-from src.kelly import kelly_criterion, Bankroll, save_bankroll, BANKROLL_FILE
+from src.kelly import (
+    kelly_criterion, Bankroll, save_bankroll, BANKROLL_FILE,
+    risk_of_ruin, expected_growth_rate, optimal_kelly_for_ruin,
+)
 from src.market_reader import ROUND_DURATION
 
 logging.basicConfig(
@@ -51,7 +53,7 @@ log = logging.getLogger("backtest")
 
 GAMMA_DELAY = 0.12
 BINANCE_KLINE_URL = "https://api.binance.com/api/v3/klines"
-EVAL_OFFSET = 120  # evaluate 2 min before close
+EVAL_OFFSET = 120
 
 
 # ── BTC price history from Binance ────────────────────────────
@@ -108,7 +110,6 @@ def fetch_btc_price_history(start_ts: int, end_ts: int) -> dict[int, float]:
 def lookup_price(prices: dict[int, float], target_ts: int) -> float | None:
     """Find the closest price to target_ts (within 120 seconds)."""
     minute = target_ts - (target_ts % 60)
-
     for offset in [0, -60, 60, -120, 120]:
         p = prices.get(minute + offset)
         if p is not None:
@@ -148,6 +149,9 @@ class BacktestTrade:
     btc_move_pct: float
     win_prob_est: float
     seconds_before_close: int
+    ruin_prob: float = 0.0
+    quality_grade: str = ""
+    features: dict = None
 
 
 def fetch_resolved_rounds(hours_back: int) -> list[ResolvedRound]:
@@ -250,6 +254,127 @@ def fetch_resolved_rounds(hours_back: int) -> list[ResolvedRound]:
     return sorted(rounds, key=lambda r: r.start_ts)
 
 
+# ── Feature extraction (mirrors live strategy) ───────────────
+
+def _sigmoid(x: float, midpoint: float = 0.5, steepness: float = 10.0) -> float:
+    z = steepness * (x - midpoint)
+    z = max(-20, min(20, z))
+    return 1.0 / (1.0 + math.exp(-z))
+
+
+def _extract_backtest_features(
+    pct_move: float,
+    seconds_remaining: float,
+    btc_prices: dict[int, float],
+    round_start_ts: int,
+    eval_ts: int,
+    opening_price: float,
+    direction: str,
+) -> dict:
+    """
+    Build the same feature vector as the live strategy, adapted for
+    backtest (no real-time order book or multi-source oracle).
+    """
+    magnitude_scaled = _sigmoid(pct_move, midpoint=0.0004, steepness=8000)
+
+    time_fraction = 1.0 - (seconds_remaining / 300.0)
+    time_pressure = _sigmoid(time_fraction, midpoint=0.6, steepness=8)
+
+    # Momentum consistency from 1-minute bars
+    bar_prices = []
+    for ts in range(round_start_ts, eval_ts + 60, 60):
+        p = btc_prices.get(ts - (ts % 60))
+        if p is not None:
+            bar_prices.append(p)
+
+    if len(bar_prices) >= 3:
+        deltas = [bar_prices[i] - bar_prices[i-1] for i in range(1, len(bar_prices))]
+        if direction == "up":
+            consistent = sum(1 for d in deltas if d > 0)
+        else:
+            consistent = sum(1 for d in deltas if d < 0)
+        momentum_consistency = 0.3 + 0.7 * (consistent / len(deltas))
+    else:
+        momentum_consistency = 0.5
+
+    # Momentum acceleration
+    if len(bar_prices) >= 4:
+        deltas = [bar_prices[i] - bar_prices[i-1] for i in range(1, len(bar_prices))]
+        mid = len(deltas) // 2
+        early_mag = sum(abs(d) for d in deltas[:mid]) / max(1, mid)
+        late_mag = sum(abs(d) for d in deltas[mid:]) / max(1, len(deltas) - mid)
+        accel_ratio = late_mag / early_mag if early_mag > 0 else 1.0
+        if direction == "up":
+            late_dir = sum(1 for d in deltas[mid:] if d > 0) / max(1, len(deltas) - mid)
+        else:
+            late_dir = sum(1 for d in deltas[mid:] if d < 0) / max(1, len(deltas) - mid)
+        momentum_accel = 0.5 * min(1.0, accel_ratio / 2.0) + 0.5 * late_dir
+    else:
+        momentum_accel = 0.5
+
+    oracle_agreement = 0.7
+    chainlink_agrees = 0.7
+
+    # Volatility regime from bars before round start
+    pre_prices = []
+    for ts in range(round_start_ts - 600, round_start_ts, 60):
+        p = btc_prices.get(ts - (ts % 60))
+        if p is not None:
+            pre_prices.append(p)
+
+    if len(pre_prices) >= 3:
+        returns = [(pre_prices[i] - pre_prices[i-1]) / pre_prices[i-1]
+                    for i in range(1, len(pre_prices)) if pre_prices[i-1] > 0]
+        if returns:
+            mean_r = sum(returns) / len(returns)
+            var = sum((r - mean_r) ** 2 for r in returns) / len(returns)
+            vol = max(0.00005, var ** 0.5)
+        else:
+            vol = 0.0003
+    else:
+        vol = 0.0003
+    vol_norm = min(1.0, vol / 0.001)
+
+    # Higher-timeframe trend from bars before round start
+    if len(pre_prices) >= 4:
+        q1_end = len(pre_prices) // 2
+        avg_early = sum(pre_prices[:q1_end]) / q1_end
+        avg_late = sum(pre_prices[q1_end:]) / (len(pre_prices) - q1_end)
+        trend_pct = (avg_late - avg_early) / avg_early if avg_early > 0 else 0
+        if direction == "up":
+            trend_alignment = _sigmoid(trend_pct, midpoint=0.0, steepness=5000)
+        else:
+            trend_alignment = _sigmoid(-trend_pct, midpoint=0.0, steepness=5000)
+    else:
+        trend_alignment = 0.5
+
+    book_imbalance = 0.5
+    spread_quality = 0.6
+
+    return {
+        "magnitude_scaled": magnitude_scaled,
+        "time_pressure": time_pressure,
+        "momentum_consistency": momentum_consistency,
+        "oracle_agreement": oracle_agreement,
+        "chainlink_agrees": chainlink_agrees,
+        "volatility_regime": vol_norm,
+        "trend_alignment": trend_alignment,
+        "book_imbalance": book_imbalance,
+        "spread_quality": spread_quality,
+        "momentum_acceleration": momentum_accel,
+    }
+
+
+def _logistic_predict(features: dict, weights: dict) -> float:
+    """Apply logistic model with given weights."""
+    z = weights.get("intercept", -1.8)
+    for feat_name, feat_val in features.items():
+        w = weights.get(feat_name, 0.0)
+        z += w * feat_val
+    z = max(-15, min(15, z))
+    return max(0.01, min(0.99, 1.0 / (1.0 + math.exp(-z))))
+
+
 # ── Strategy replay ───────────────────────────────────────────
 
 def replay_strategy(
@@ -262,21 +387,23 @@ def replay_strategy(
     max_bet: float = 50.0,
     entry_window_start: int = 180,
     entry_window_end: int = 5,
+    ruin_target: float = 0.05,
+    ruin_level: float = 0.10,
+    weights: dict = None,
 ) -> tuple[list[BacktestTrade], Bankroll]:
     """
-    Replay the strategy with REAL data:
-      - Real BTC prices from Binance (opening + evaluation time)
-      - Real outcomes from Polymarket
-      - Real fee & Kelly calculations
-
-    For each round:
-      1. Look up BTC price at round start → opening price
-      2. Look up BTC price at (end - EVAL_OFFSET) → evaluation price
-      3. Compare → direction = "up" if eval > opening, else "down"
-      4. Estimate win probability from the size & consistency of the move
-      5. Apply fee-adjusted Kelly sizing
-      6. Check against REAL outcome from Polymarket
+    Replay the strategy with REAL data.
+    Now uses the logistic model for win-prob estimation and
+    ruin-calibrated Kelly for sizing.
     """
+    if weights is None:
+        try:
+            from src.strategy import _load_model_weights
+            weights = _load_model_weights()
+        except Exception:
+            from src.strategy import _DEFAULT_WEIGHTS
+            weights = dict(_DEFAULT_WEIGHTS)
+
     br = Bankroll(
         starting_balance=starting_bankroll,
         current_balance=starting_bankroll,
@@ -308,7 +435,18 @@ def replay_strategy(
             continue
 
         direction = "up" if delta > 0 else "down"
-        win_prob = _estimate_win_prob(pct_move, EVAL_OFFSET)
+
+        features = _extract_backtest_features(
+            pct_move=pct_move,
+            seconds_remaining=EVAL_OFFSET,
+            btc_prices=btc_prices,
+            round_start_ts=rnd.start_ts,
+            eval_ts=eval_ts,
+            opening_price=opening_price,
+            direction=direction,
+        )
+
+        win_prob = _logistic_predict(features, weights)
 
         if win_prob < confidence_floor:
             skipped_no_edge += 1
@@ -329,6 +467,8 @@ def replay_strategy(
             bankroll=br.current_balance,
             kelly_multiplier=kelly_mult,
             min_bet_dollars=0.50,
+            ruin_target=ruin_target,
+            ruin_level=ruin_level,
         )
         if not rec.should_bet:
             skipped_no_edge += 1
@@ -367,6 +507,9 @@ def replay_strategy(
             btc_move_pct=round(pct_move * 100, 4),
             win_prob_est=round(win_prob, 4),
             seconds_before_close=EVAL_OFFSET,
+            ruin_prob=round(rec.ruin_prob, 4),
+            quality_grade=rec.quality_grade,
+            features=features,
         ))
 
     log.info(
@@ -376,32 +519,220 @@ def replay_strategy(
     return trades, br
 
 
-def _estimate_win_prob(pct_move: float, seconds_remaining: float) -> float:
-    """
-    Estimate win probability from the BTC move size and time remaining.
-    Uses the same sigmoid approach as the live strategy.
-
-    Larger moves with less time remaining → higher confidence the
-    direction will persist to close.
-    """
-    magnitude = 1.0 / (1.0 + math.exp(-8000 * (pct_move - 0.0004)))
-
-    time_frac = 1.0 - (seconds_remaining / 300.0)
-    time_sig = 0.50 + 0.45 / (1.0 + math.exp(-8 * (time_frac - 0.6)))
-
-    raw = magnitude * 0.35 + time_sig * 0.40 + 0.25
-    return max(0.01, min(0.99, raw))
-
-
 def _estimate_entry_price(win_prob: float) -> float:
-    """
-    Estimate entry price based on win probability.
-    Higher confidence → market has moved further → higher entry price.
-    Typical range: 0.50-0.62 for these markets.
-    """
     base = 0.50
     premium = (win_prob - 0.50) * 0.6
     return round(min(0.65, max(0.50, base + premium)), 2)
+
+
+# ── Model weight optimiser ───────────────────────────────────
+
+def train_model_weights(
+    rounds: list[ResolvedRound],
+    btc_prices: dict[int, float],
+    starting_bankroll: float,
+    kelly_mult: float,
+    min_edge: float,
+    confidence_floor: float,
+    max_bet: float,
+    ruin_target: float = 0.05,
+    ruin_level: float = 0.10,
+) -> dict:
+    """
+    Optimise model weights to maximise the backtest objective:
+    log(final_bankroll) - penalty * max_drawdown.
+
+    Uses Nelder-Mead (no gradients needed) with a small number of
+    parameters. Falls back to random search if scipy is not available.
+    """
+    from src.strategy import _DEFAULT_WEIGHTS
+
+    param_names = [k for k in _DEFAULT_WEIGHTS if k != "intercept"]
+    initial = [_DEFAULT_WEIGHTS[k] for k in param_names]
+    best_intercept = _DEFAULT_WEIGHTS["intercept"]
+
+    def objective(params):
+        weights = {"intercept": best_intercept}
+        for name, val in zip(param_names, params):
+            weights[name] = val
+
+        trades, br = replay_strategy(
+            rounds=rounds,
+            btc_prices=btc_prices,
+            starting_bankroll=starting_bankroll,
+            kelly_mult=kelly_mult,
+            min_edge=min_edge,
+            confidence_floor=confidence_floor,
+            max_bet=max_bet,
+            ruin_target=ruin_target,
+            ruin_level=ruin_level,
+            weights=weights,
+        )
+
+        if not trades or br.current_balance <= 0:
+            return 1000.0
+
+        log_return = math.log(br.current_balance / starting_bankroll)
+        dd_penalty = br.max_drawdown * 2.0
+        # Penalise low trade count (want at least some trades for statistical significance)
+        trade_penalty = max(0, 10 - len(trades)) * 0.1
+
+        return -(log_return - dd_penalty - trade_penalty)
+
+    try:
+        from scipy.optimize import minimize as scipy_minimize
+        log.info("Optimising weights with Nelder-Mead (scipy)...")
+
+        result = scipy_minimize(
+            objective, initial, method="Nelder-Mead",
+            options={"maxiter": 200, "xatol": 0.05, "fatol": 0.01},
+        )
+        best_params = result.x
+        log.info("Optimisation done: fun=%.4f, iterations=%d", result.fun, result.nit)
+
+    except ImportError:
+        log.info("scipy not available — using random search (100 iterations)...")
+        import random
+        best_score = objective(initial)
+        best_params = list(initial)
+
+        for i in range(100):
+            candidate = [v + random.gauss(0, 0.3) for v in best_params]
+            score = objective(candidate)
+            if score < best_score:
+                best_score = score
+                best_params = candidate
+                log.info("  iter %d: new best score=%.4f", i, -score)
+
+    optimised = {"intercept": best_intercept}
+    for name, val in zip(param_names, best_params):
+        optimised[name] = round(val, 4)
+
+    return optimised
+
+
+# ── Analytics ─────────────────────────────────────────────────
+
+def compute_analytics(trades: list[BacktestTrade], bankroll: Bankroll) -> dict:
+    """Compute comprehensive backtest analytics."""
+    if not trades:
+        return {}
+
+    pnls = [t.pnl for t in trades]
+    wins = [t for t in trades if t.won]
+    losses = [t for t in trades if not t.won]
+
+    total_pnl = sum(pnls)
+    total_wagered = sum(t.bet_dollars for t in trades)
+
+    # Equity curve
+    equity = [bankroll.starting_balance]
+    for t in trades:
+        equity.append(equity[-1] + t.pnl)
+
+    # Max drawdown from equity curve
+    peak = equity[0]
+    max_dd = 0.0
+    max_dd_duration = 0
+    current_dd_start = 0
+
+    for i, e in enumerate(equity):
+        if e > peak:
+            peak = e
+            current_dd_start = i
+        dd = (peak - e) / peak if peak > 0 else 0
+        if dd > max_dd:
+            max_dd = dd
+            max_dd_duration = i - current_dd_start
+
+    # Sharpe ratio (per-trade, then annualised assuming 288 trades/day for 5m intervals)
+    mean_pnl = sum(pnls) / len(pnls)
+    var_pnl = sum((p - mean_pnl) ** 2 for p in pnls) / len(pnls)
+    std_pnl = var_pnl ** 0.5
+    sharpe = mean_pnl / std_pnl if std_pnl > 0 else 0.0
+    sharpe_annual = sharpe * (288 ** 0.5)
+
+    # Sortino ratio (only downside deviation)
+    downside = [p for p in pnls if p < 0]
+    if downside:
+        downside_var = sum(p ** 2 for p in downside) / len(pnls)
+        downside_std = downside_var ** 0.5
+        sortino = mean_pnl / downside_std if downside_std > 0 else 0.0
+    else:
+        sortino = float("inf") if mean_pnl > 0 else 0.0
+
+    # Calmar ratio
+    calmar = (total_pnl / bankroll.starting_balance) / max_dd if max_dd > 0 else 0.0
+
+    # Profit factor
+    gross_win = sum(t.pnl for t in wins) if wins else 0
+    gross_loss = abs(sum(t.pnl for t in losses)) if losses else 0
+    profit_factor = gross_win / gross_loss if gross_loss > 0 else float("inf")
+
+    # Win/loss streaks
+    max_ws = max_ls = cw = cl = 0
+    for t in trades:
+        if t.won:
+            cw += 1; cl = 0; max_ws = max(max_ws, cw)
+        else:
+            cl += 1; cw = 0; max_ls = max(max_ls, cl)
+
+    # Average win/loss
+    avg_win = sum(t.pnl for t in wins) / len(wins) if wins else 0
+    avg_loss = sum(t.pnl for t in losses) / len(losses) if losses else 0
+
+    # Risk of ruin estimate from observed stats
+    if trades:
+        avg_edge_val = sum(t.edge for t in trades) / len(trades)
+        avg_kelly_val = sum(t.kelly_fraction for t in trades) / len(trades)
+        avg_price = sum(t.entry_price for t in trades) / len(trades)
+        obs_win_rate = len(wins) / len(trades)
+        ruin_est = risk_of_ruin(obs_win_rate, avg_price, avg_kelly_val, 0.1)
+    else:
+        avg_edge_val = avg_kelly_val = ruin_est = 0
+
+    # Grade distribution
+    grades = {"A": 0, "B": 0, "C": 0, "D": 0}
+    for t in trades:
+        g = t.quality_grade if t.quality_grade in grades else "D"
+        grades[g] += 1
+
+    # Grade-level win rates
+    grade_wr = {}
+    for g in ["A", "B", "C", "D"]:
+        g_trades = [t for t in trades if t.quality_grade == g]
+        if g_trades:
+            grade_wr[g] = sum(1 for t in g_trades if t.won) / len(g_trades)
+
+    return {
+        "total_trades": len(trades),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": len(wins) / len(trades),
+        "total_pnl": total_pnl,
+        "total_wagered": total_wagered,
+        "roi": total_pnl / bankroll.starting_balance,
+        "starting_bankroll": bankroll.starting_balance,
+        "final_bankroll": bankroll.current_balance,
+        "peak_bankroll": bankroll.peak_balance,
+        "max_drawdown": max_dd,
+        "max_dd_duration_trades": max_dd_duration,
+        "sharpe_per_trade": sharpe,
+        "sharpe_annualised": sharpe_annual,
+        "sortino": sortino,
+        "calmar": calmar,
+        "profit_factor": profit_factor,
+        "expectancy": mean_pnl,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "avg_edge": avg_edge_val,
+        "avg_kelly": avg_kelly_val,
+        "risk_of_ruin_est": ruin_est,
+        "max_win_streak": max_ws,
+        "max_loss_streak": max_ls,
+        "grade_distribution": grades,
+        "grade_win_rates": grade_wr,
+    }
 
 
 # ── Output ────────────────────────────────────────────────────
@@ -411,16 +742,13 @@ def print_results(
     bankroll: Bankroll,
     hours_back: int,
     total_rounds: int,
+    analytics: dict,
 ):
-    wins = [t for t in trades if t.won]
-    losses = [t for t in trades if not t.won]
-    total_pnl = sum(t.pnl for t in trades)
-    total_wagered = sum(t.bet_dollars for t in trades)
-
     print()
     print("=" * 72)
-    print("  FULLY REAL HISTORICAL BACKTEST")
+    print("  FULLY REAL HISTORICAL BACKTEST (v2)")
     print("  BTC prices: Binance  |  Outcomes: Polymarket  |  Fees: real")
+    print("  Model: Logistic regression  |  Sizing: Ruin-calibrated Kelly")
     print("=" * 72)
     print(f"  Period:               Last {hours_back} hours")
     print(f"  Resolved rounds:      {total_rounds}")
@@ -433,40 +761,56 @@ def print_results(
         print("=" * 72)
         return
 
-    print(f"  Wins:                 {len(wins)}")
-    print(f"  Losses:               {len(losses)}")
-    wr = len(wins) / len(trades) * 100
-    print(f"  Win rate:             {wr:.1f}%")
+    a = analytics
+    print(f"  Wins:                 {a['wins']}")
+    print(f"  Losses:               {a['losses']}")
+    print(f"  Win rate:             {a['win_rate']*100:.1f}%")
     print()
-    print(f"  Total wagered:        ${total_wagered:.2f}")
-    print(f"  Total PnL:            ${total_pnl:+.2f}")
-    print(f"  ROI:                  {total_pnl/bankroll.starting_balance*100:+.1f}%")
+    print(f"  Total wagered:        ${a['total_wagered']:.2f}")
+    print(f"  Total PnL:            ${a['total_pnl']:+.2f}")
+    print(f"  ROI:                  {a['roi']*100:+.1f}%")
     print()
-    print(f"  Starting bankroll:    ${bankroll.starting_balance:.2f}")
-    print(f"  Final bankroll:       ${bankroll.current_balance:.2f}")
-    print(f"  Peak bankroll:        ${bankroll.peak_balance:.2f}")
-    print(f"  Max drawdown:         {bankroll.drawdown*100:.1f}%")
-
-    avg_edge = sum(t.edge for t in trades) / len(trades)
-    avg_kelly = sum(t.kelly_fraction for t in trades) / len(trades)
-    avg_bet = total_wagered / len(trades)
-    avg_pnl = total_pnl / len(trades)
-    avg_move = sum(t.btc_move_pct for t in trades) / len(trades)
-    avg_wp = sum(t.win_prob_est for t in trades) / len(trades)
-
-    gross_win = sum(t.pnl for t in wins) if wins else 0
-    gross_loss = abs(sum(t.pnl for t in losses)) if losses else 0
-    pf = gross_win / gross_loss if gross_loss > 0 else float("inf")
+    print(f"  Starting bankroll:    ${a['starting_bankroll']:.2f}")
+    print(f"  Final bankroll:       ${a['final_bankroll']:.2f}")
+    print(f"  Peak bankroll:        ${a['peak_bankroll']:.2f}")
+    print(f"  Max drawdown:         {a['max_drawdown']*100:.1f}% ({a['max_dd_duration_trades']} trades)")
 
     print()
     print("  " + "-" * 54)
-    print(f"  Avg BTC move at eval: {avg_move:.4f}%")
-    print(f"  Avg win probability:  {avg_wp*100:.1f}%")
-    print(f"  Avg edge (fee-adj):   {avg_edge*100:.2f}%")
-    print(f"  Avg Kelly fraction:   {avg_kelly*100:.2f}%")
-    print(f"  Avg bet size:         ${avg_bet:.2f}")
-    print(f"  Avg PnL per trade:    ${avg_pnl:.4f}")
-    print(f"  Profit factor:        {pf:.2f}")
+    print("  RISK-ADJUSTED RETURNS:")
+    print(f"    Sharpe (per-trade): {a['sharpe_per_trade']:.3f}")
+    print(f"    Sharpe (annual):    {a['sharpe_annualised']:.2f}")
+    print(f"    Sortino:            {a['sortino']:.3f}")
+    print(f"    Calmar:             {a['calmar']:.2f}")
+    print(f"    Profit factor:      {a['profit_factor']:.2f}")
+
+    print()
+    print("  " + "-" * 54)
+    print("  TRADE STATISTICS:")
+    print(f"    Expectancy:         ${a['expectancy']:.4f}/trade")
+    print(f"    Avg win:            ${a['avg_win']:.4f}")
+    print(f"    Avg loss:           ${a['avg_loss']:.4f}")
+    print(f"    Avg edge (fee-adj): {a['avg_edge']*100:.2f}%")
+    print(f"    Avg Kelly fraction: {a['avg_kelly']*100:.2f}%")
+    print(f"    Risk of ruin est:   {a['risk_of_ruin_est']*100:.2f}%")
+
+    print()
+    print("  " + "-" * 54)
+    print("  STREAKS:")
+    print(f"    Max win streak:     {a['max_win_streak']}")
+    print(f"    Max loss streak:    {a['max_loss_streak']}")
+
+    grades = a.get("grade_distribution", {})
+    grade_wr = a.get("grade_win_rates", {})
+    if any(v > 0 for v in grades.values()):
+        print()
+        print("  " + "-" * 54)
+        print("  BET QUALITY GRADES:")
+        for g in ["A", "B", "C", "D"]:
+            count = grades.get(g, 0)
+            wr = grade_wr.get(g, 0)
+            if count > 0:
+                print(f"    Grade {g}: {count:>4} trades  ({wr*100:.1f}% win rate)")
 
     up_outcomes = sum(1 for t in trades if t.outcome == "up")
     dn_outcomes = len(trades) - up_outcomes
@@ -478,23 +822,13 @@ def print_results(
     print(f"    Market up:          {up_outcomes} ({up_outcomes/len(trades)*100:.0f}%)")
     print(f"    Market down:        {dn_outcomes} ({dn_outcomes/len(trades)*100:.0f}%)")
 
-    max_ws = max_ls = cw = cl = 0
-    for t in trades:
-        if t.won:
-            cw += 1; cl = 0; max_ws = max(max_ws, cw)
-        else:
-            cl += 1; cw = 0; max_ls = max(max_ls, cl)
-    print()
-    print(f"  Max win streak:       {max_ws}")
-    print(f"  Max loss streak:      {max_ls}")
-
     print()
     print("  " + "-" * 54)
     print("  TRADE LOG (last 30):")
-    hdr = (f"    {'Time':>14}  {'Result':>5}  {'Pick':>4}  {'Real':>4}  "
+    hdr = (f"    {'Time':>14}  {'Res':>4} {'Grd':>3}  {'Pick':>4}  {'Real':>4}  "
            f"{'BTC Move':>9}  {'P(w)':>5}  {'Bet':>8}  {'PnL':>9}  {'Balance':>9}")
     print(hdr)
-    print("    " + "-" * 84)
+    print("    " + "-" * 88)
 
     bal = bankroll.starting_balance
     bals = []
@@ -508,7 +842,7 @@ def print_results(
         ts_str = time.strftime("%m/%d %H:%M", time.gmtime(t.timestamp))
         move_str = f"{t.btc_move_pct:+.4f}%"
         print(
-            f"    {ts_str}  {res:>5}  {t.direction:>4}  {t.outcome:>4}  "
+            f"    {ts_str}  {res:>4} {t.quality_grade:>3}  {t.direction:>4}  {t.outcome:>4}  "
             f"{move_str:>9}  {t.win_prob_est:.2f}  "
             f"${t.bet_dollars:>7.2f}  ${t.pnl:>+8.4f}  ${bals[idx]:>8.2f}"
         )
@@ -517,17 +851,24 @@ def print_results(
     print("=" * 72)
     print("  WHAT IS REAL:")
     print("    - BTC prices at round start & evaluation: Binance 1m klines")
-    print("    - Direction decision: real BTC price comparison (not random)")
+    print("    - Direction decision: real BTC price comparison")
     print("    - Win/loss outcome: actual Polymarket on-chain resolution")
     print("    - Fees: Polymarket crypto fee formula")
+    print("    - Sizing: Ruin-calibrated Kelly criterion")
     print("  WHAT IS ESTIMATED:")
-    print("    - Entry price (no historical order book available)")
+    print("    - Entry price (no historical order book)")
+    print("    - Oracle agreement / book imbalance features")
     print("=" * 72)
     print()
 
 
 def save_trade_log(trades: list[BacktestTrade], filepath: Path):
-    data = [asdict(t) for t in trades]
+    data = []
+    for t in trades:
+        d = asdict(t)
+        if d.get("features"):
+            d["features"] = {k: round(v, 4) for k, v in d["features"].items()}
+        data.append(d)
     filepath.parent.mkdir(parents=True, exist_ok=True)
     filepath.write_text(json.dumps(data, indent=2))
     log.info("Trade log saved to %s (%d trades)", filepath, len(data))
@@ -535,7 +876,7 @@ def save_trade_log(trades: list[BacktestTrade], filepath: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fully real backtest: Binance prices + Polymarket outcomes"
+        description="Fully real backtest v2: Binance prices + Polymarket outcomes"
     )
     parser.add_argument("--hours", type=int, default=24,
                         help="Hours of history (default: 24)")
@@ -548,22 +889,29 @@ def main():
     parser.add_argument("--confidence-floor", type=float, default=0.55,
                         help="Min win probability (default: 0.55)")
     parser.add_argument("--max-bet", type=float, default=50.0,
-                        help="Max bet per trade in USD — reflects real "
-                             "Polymarket liquidity (default: 50)")
+                        help="Max bet per trade in USD (default: 50)")
+    parser.add_argument("--ruin-target", type=float, default=0.05,
+                        help="Max acceptable risk of ruin (default: 0.05)")
+    parser.add_argument("--ruin-level", type=float, default=0.10,
+                        help="Fraction of bankroll that = ruin (default: 0.10)")
     parser.add_argument("--save", action="store_true",
                         help="Save bankroll.json and trade_log.json")
+    parser.add_argument("--train", action="store_true",
+                        help="Train & save optimal model weights")
     args = parser.parse_args()
 
     print()
     print("=" * 72)
-    print("  FULLY REAL BACKTEST — Binance prices + Polymarket outcomes")
+    print("  FULLY REAL BACKTEST v2 — Binance prices + Polymarket outcomes")
     print("=" * 72)
     print(f"  Period: last {args.hours} hours  |  Bankroll: ${args.bankroll:.2f}")
     print(f"  Kelly: {args.kelly:.0%}  |  Min edge: {args.min_edge*100:.1f}%  |  Max bet: ${args.max_bet:.0f}")
+    print(f"  Ruin target: {args.ruin_target:.0%}  |  Ruin level: {args.ruin_level:.0%}")
+    if args.train:
+        print(f"  MODE: TRAINING — will optimise and save model weights")
     print("=" * 72)
     print()
 
-    # Step 1: fetch BTC price history from Binance
     now = int(time.time())
     start = now - (args.hours * 3600)
     btc_prices = fetch_btc_price_history(start - 300, now)
@@ -573,7 +921,6 @@ def main():
         print("  (May be geo-blocked. Try with a VPN or different network.)")
         return
 
-    # Step 2: fetch resolved rounds from Polymarket
     rounds = fetch_resolved_rounds(args.hours)
     if not rounds:
         print("  No resolved rounds found.")
@@ -584,7 +931,26 @@ def main():
     log.info("Real outcomes: %d up (%.0f%%) / %d down (%.0f%%)",
              up_ct, up_ct / len(rounds) * 100, dn_ct, dn_ct / len(rounds) * 100)
 
-    # Step 3: replay strategy with real data
+    # Optionally train model weights
+    if args.train:
+        print("  Training model weights (this may take a few minutes)...")
+        optimised = train_model_weights(
+            rounds=rounds,
+            btc_prices=btc_prices,
+            starting_bankroll=args.bankroll,
+            kelly_mult=args.kelly,
+            min_edge=args.min_edge,
+            confidence_floor=args.confidence_floor,
+            max_bet=args.max_bet,
+            ruin_target=args.ruin_target,
+            ruin_level=args.ruin_level,
+        )
+        from src.strategy import save_model_weights
+        save_model_weights(optimised)
+        print(f"  Optimised weights saved to data/model_weights.json")
+        print(f"  Weights: {json.dumps(optimised, indent=2)}")
+        print()
+
     trades, bankroll = replay_strategy(
         rounds=rounds,
         btc_prices=btc_prices,
@@ -593,9 +959,12 @@ def main():
         min_edge=args.min_edge,
         confidence_floor=args.confidence_floor,
         max_bet=args.max_bet,
+        ruin_target=args.ruin_target,
+        ruin_level=args.ruin_level,
     )
 
-    print_results(trades, bankroll, args.hours, len(rounds))
+    analytics = compute_analytics(trades, bankroll)
+    print_results(trades, bankroll, args.hours, len(rounds), analytics)
 
     if args.save and trades:
         save_bankroll(bankroll)
@@ -604,8 +973,14 @@ def main():
         log_file = Path(__file__).resolve().parent.parent / "data" / "trade_log.json"
         save_trade_log(trades, log_file)
 
+        analytics_file = Path(__file__).resolve().parent.parent / "data" / "backtest_analytics.json"
+        analytics_file.parent.mkdir(parents=True, exist_ok=True)
+        analytics_file.write_text(json.dumps(analytics, indent=2, default=str))
+        log.info("Analytics saved to %s", analytics_file)
+
         print(f"  Saved: {BANKROLL_FILE}")
         print(f"  Saved: {log_file}")
+        print(f"  Saved: {analytics_file}")
         print()
 
 

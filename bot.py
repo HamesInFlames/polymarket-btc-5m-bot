@@ -1,6 +1,6 @@
 """
-Polymarket BTC 5-Minute Oracle-Verified Trading Bot
-====================================================
+Polymarket BTC 5-Minute Oracle-Verified Trading Bot (v2)
+========================================================
 Main entry point.  Runs a continuous loop that:
   1. Discovers active BTC 5-min up/down rounds on Polymarket.
   2. Captures the opening BTC price for each round (from market
@@ -13,6 +13,14 @@ Main entry point.  Runs a continuous loop that:
   5. After the round ends, checks the ACTUAL resolution from
      Polymarket's Gamma API (or Chainlink fallback) — no random
      simulation — and updates bankroll from real outcomes.
+
+v2 changes:
+  - Ruin-calibrated Kelly sizing (auto-reduces multiplier when
+    risk-of-ruin exceeds target).
+  - Adaptive Kelly cooldown after losing streaks (via risk manager).
+  - Drawdown circuit breaker halts trading at configurable threshold.
+  - Bet quality grades (A/B/C/D) logged and tracked.
+  - Feature vectors recorded per trade for model retraining.
 
 DISCLAIMER: This software is for educational and research purposes only.
 It is NOT financial advice.  Algorithmic trading carries substantial risk
@@ -32,6 +40,9 @@ from src.config import (
     ENTRY_WINDOW_END,
     MIN_EDGE,
     KELLY_MULTIPLIER,
+    RUIN_TARGET,
+    RUIN_LEVEL,
+    MAX_DRAWDOWN_HALT,
 )
 from src.market_reader import (
     discover_active_btc_5m_markets,
@@ -47,6 +58,7 @@ from src.fees import effective_fee_rate
 from src.bot_state import state as dashboard, TradeEntry, install_log_handler
 from src.redeemer import (
     fetch_wallet_balances,
+    redeem_winning_position_blocking,
     sweep_unredeemed_positions,
 )
 from src.geoblock import (
@@ -57,6 +69,7 @@ from src.geoblock import (
 )
 from src.ws_client import get_ws_client
 from src.data_api import reconcile_bankroll
+from src.kelly import risk_of_ruin, optimal_kelly_for_ruin
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,6 +92,7 @@ RESOLUTION_TIMEOUT_SECONDS = 300
 OPENING_PRICE_MAX_AGE = 30
 
 _force_wallet_refresh = False
+_won_conditions: list[tuple[str, bool]] = []
 
 WALLET_REFRESH_SECONDS = 15
 
@@ -118,28 +132,42 @@ class PendingTrade:
     is_live: bool
     neg_risk: bool = False
     resolution_attempts: int = 0
+    ruin_prob: float = 0.0
+    quality_grade: str = ""
+    features: dict = None
 
 
 def print_banner():
     mode = "LIVE" if LIVE_TRADING else "DRY RUN (paper — real resolution)"
     br = get_bankroll()
+
+    # Compute the ruin-optimal multiplier for display
+    est_win_prob = 0.55
+    est_price = 0.50
+    opt_mult = optimal_kelly_for_ruin(est_win_prob, est_price, RUIN_TARGET, RUIN_LEVEL)
+    ruin_p = risk_of_ruin(est_win_prob, est_price, 0.10, RUIN_LEVEL)
+
     print()
     print("=" * 62)
-    print("   Polymarket BTC 5-Min Oracle-Verified Bot")
+    print("   Polymarket BTC 5-Min Oracle-Verified Bot (v2)")
     print("=" * 62)
     print(f"   Mode:                {mode}")
     print(f"   Bankroll:            ${br.current_balance:.2f} (started ${br.starting_balance:.2f})")
-    print(f"   Kelly multiplier:    {KELLY_MULTIPLIER:.0%} Kelly (quarter)")
-    print(f"   Bet sizing:          Kelly-optimal (capped at {KELLY_MULTIPLIER:.0%})")
+    print(f"   Kelly multiplier:    {KELLY_MULTIPLIER:.0%} Kelly (ruin-calibrated)")
+    print(f"   Ruin target:         {RUIN_TARGET:.0%} (at {RUIN_LEVEL:.0%} of bankroll)")
+    print(f"   Optimal Kelly mult:  {opt_mult:.2f} (for P(win)={est_win_prob}, price={est_price})")
+    print(f"   Bet sizing:          Kelly-optimal + drawdown scaling")
     print(f"   Profit reinvestment: 100% (compounding)")
     print(f"   Min edge threshold:  {MIN_EDGE*100:.1f}% (after Polymarket fees)")
     print(f"   Crypto fee at 50c:   ~1.56% (auto-fetched per token)")
     print(f"   Entry window:        {ENTRY_WINDOW_START}s -> {ENTRY_WINDOW_END}s before close")
+    print(f"   Max DD halt:         {MAX_DRAWDOWN_HALT*100:.0f}%")
     print(f"   Resolution:          REAL (Polymarket Gamma API + Chainlink)")
     if br.num_bets > 0:
         print(f"   Lifetime bets:       {br.num_bets} ({br.win_rate*100:.1f}% win rate)")
         print(f"   Lifetime P&L:        ${br.total_profit:+.2f} ({br.roi*100:+.1f}% ROI)")
         print(f"   Current drawdown:    {br.drawdown*100:.1f}%")
+        print(f"   Max drawdown:        {br.max_drawdown*100:.1f}%")
     print("=" * 62)
     if not LIVE_TRADING:
         print("   *** DRY RUN — orders are simulated but outcomes are REAL ***")
@@ -189,10 +217,54 @@ def _refresh_wallet(force_increase: bool = False):
         br = get_bankroll()
         dashboard.update_wallet(wb["address"], wb["usdc"], wb["pol"],
                                 bankroll=br.current_balance)
+        dashboard.update_bankroll_meta(
+            starting=br.starting_balance,
+            peak=br.peak_balance,
+            num_bets=br.num_bets,
+            num_wins=br.num_wins,
+            total_wagered=br.total_wagered,
+            max_drawdown=br.max_drawdown,
+        )
         return True
     except Exception as e:
         log.debug("Wallet balance fetch failed: %s", e)
         return False
+
+
+def _redeem_all_and_exit():
+    """Blocking redeem: first directly redeem known winning conditions,
+    then sweep the API for anything else. Refreshes wallet at the end."""
+    redeemed = 0
+
+    if _won_conditions:
+        log.info("Directly redeeming %d known winning condition(s)...", len(_won_conditions))
+        for cid, neg_risk in _won_conditions:
+            try:
+                tx = redeem_winning_position_blocking(cid, neg_risk=neg_risk)
+                if tx:
+                    log.info("Redeemed %s: tx=%s", cid[:12], tx)
+                    redeemed += 1
+                else:
+                    log.warning("Redeem returned None for %s (may already be redeemed)", cid[:12])
+            except Exception as e:
+                log.warning("Direct redeem failed for %s: %s", cid[:12], e)
+            time.sleep(2)
+        _won_conditions.clear()
+
+    log.info("Running catch-all sweep for any remaining positions...")
+    try:
+        time.sleep(3)
+        n = sweep_unredeemed_positions()
+        if n:
+            log.info("Sweep redeemed %d additional position(s)", n)
+            redeemed += n
+        else:
+            log.info("Sweep found nothing extra to redeem")
+    except Exception as e:
+        log.warning("Sweep failed: %s", e)
+
+    log.info("Total redeemed: %d position(s)", redeemed)
+    _refresh_wallet()
 
 
 def main_loop():
@@ -227,7 +299,14 @@ def main_loop():
         dashboard.update_bot_status(True, cycle, trade_count, 0, mode)
 
         allowed, risk_reason = risk.pre_trade_check()
+        kelly_scale = risk.kelly_scale_factor()
         dashboard.update_risk_stats(risk.stats_summary())
+
+        if kelly_scale < 1.0:
+            log.info(
+                "Adaptive Kelly cooldown active: scale=%.2f (consecutive losses=%d)",
+                kelly_scale, risk.consecutive_losses(),
+            )
 
         now = time.time()
         if _force_wallet_refresh or (now - _last_wallet_refresh_time) >= WALLET_REFRESH_SECONDS:
@@ -236,8 +315,8 @@ def main_loop():
             _refresh_wallet()
 
         log.info(
-            "-- Cycle %d  [trades: %d | pending: %d] -------------------------",
-            cycle, trade_count, len(pending_trades),
+            "-- Cycle %d  [trades: %d | pending: %d | kelly_scale: %.2f] ----",
+            cycle, trade_count, len(pending_trades), kelly_scale,
         )
 
         # ── Phase 0.5: process any WebSocket resolution events ──
@@ -311,7 +390,6 @@ def main_loop():
         pending_ids = {p.condition_id for p in pending_trades}
         tracker.cleanup(active_ids, pending_ids)
 
-        # Subscribe to WebSocket for real-time price data on active tokens
         ws_tokens = []
         for r in rounds:
             ws_tokens.extend([r.up_token_id, r.down_token_id])
@@ -351,15 +429,28 @@ def main_loop():
                 log.info("  -> No signal (edge/confidence/price insufficient)")
                 continue
 
+            # Apply adaptive Kelly cooldown from risk manager
+            if kelly_scale < 1.0 and sig.bet_dollars > 0:
+                scaled_bet = sig.bet_dollars * kelly_scale
+                scaled_size = sig.size * kelly_scale
+                log.info(
+                    "Kelly cooldown: $%.2f -> $%.2f (scale=%.2f)",
+                    sig.bet_dollars, scaled_bet, kelly_scale,
+                )
+                sig.bet_dollars = scaled_bet
+                sig.size = scaled_size
+
             log.info(
-                ">>> EXECUTING: %s on %s | P(win)=%.3f edge=%.4f (fee-adj) | "
+                ">>> EXECUTING: %s [%s] on %s | P(win)=%.3f edge=%.4f (fee-adj) | "
                 "price=$%.3f eff=$%.3f fee=%.2f%% | "
-                "Kelly=%.4f -> $%.2f (%.1f contracts @ $%.3f) | EV=$%.4f",
-                sig.action, rnd.condition_id[:12],
+                "Kelly=%.4f -> $%.2f (%.1f contracts @ $%.3f) | "
+                "ruin=%.3f | EV=$%.4f",
+                sig.action, sig.quality_grade, rnd.condition_id[:12],
                 sig.confidence, sig.edge,
                 sig.price, sig.effective_price, sig.fee_rate_pct,
                 sig.kelly_fraction, sig.bet_dollars,
-                sig.size, sig.price, sig.expected_profit,
+                sig.size, sig.price,
+                sig.ruin_prob, sig.expected_profit,
             )
 
             fill = place_buy_order(
@@ -376,10 +467,6 @@ def main_loop():
                 tracker.mark_traded(rnd.condition_id)
                 trade_count += 1
 
-                # bet_dollars = raw USDC paid (contracts * price).
-                # The fee is taken in shares (fewer shares received),
-                # NOT as extra USDC cost. Accounted for in _record_resolution
-                # by reducing effective_contracts.
                 actual_bet = fill.filled_size * fill.avg_price
 
                 pending = PendingTrade(
@@ -402,6 +489,9 @@ def main_loop():
                     round_end_timestamp=rnd.end_timestamp,
                     is_live=fill.is_live,
                     neg_risk=sig.neg_risk,
+                    ruin_prob=sig.ruin_prob,
+                    quality_grade=sig.quality_grade,
+                    features=sig.features,
                 )
                 pending_trades.append(pending)
 
@@ -430,8 +520,9 @@ def main_loop():
 
                 dashboard.add_log(
                     "INFO",
-                    f"Trade #{trade_count}: {sig.action} "
+                    f"Trade #{trade_count}: {sig.action} [{sig.quality_grade}] "
                     f"edge={sig.edge:.4f} kelly={sig.kelly_fraction:.4f} "
+                    f"ruin={sig.ruin_prob:.3f} "
                     f"filled={fill.filled_size:.1f}/{fill.requested_size:.1f} "
                     f"@ ${fill.avg_price:.3f} -> PENDING resolution",
                 )
@@ -444,14 +535,13 @@ def main_loop():
         _print_status(cycle, rounds, pending_trades)
         dashboard.update_risk_stats(risk.stats_summary())
 
-        # ── Phase 5: second resolve pass — catch trades that ended during this cycle ──
+        # ── Phase 5: second resolve pass ──
         if pending_trades:
             pre_count = len(pending_trades)
             _resolve_pending_trades(pending_trades, tracker)
             if len(pending_trades) < pre_count:
                 _force_wallet_refresh = True
 
-        # ── Phase 5b: if redeem completed during this cycle, refresh wallet now ──
         if _force_wallet_refresh:
             _force_wallet_refresh = False
             _last_wallet_refresh_time = time.time()
@@ -459,18 +549,8 @@ def main_loop():
 
         # ── Phase 6: if we traded this cycle and all trades resolved, redeem & exit ──
         if trade_count > 0 and not pending_trades:
-            log.info("All trades resolved — running final blocking redeem sweep...")
             if LIVE_TRADING:
-                try:
-                    time.sleep(5)
-                    n = sweep_unredeemed_positions()
-                    if n:
-                        log.info("Final redeem sweep: claimed %d position(s)", n)
-                    else:
-                        log.info("Final redeem sweep: nothing to redeem (may already be redeemed)")
-                except Exception as e:
-                    log.warning("Final redeem sweep failed: %s", e)
-                _refresh_wallet()
+                _redeem_all_and_exit()
             break
 
         sleep_time = _calculate_sleep(rounds, pending_trades)
@@ -486,15 +566,7 @@ def main_loop():
                 break
             _sleep(2)
         if not pending_trades and LIVE_TRADING:
-            log.info("Late resolution complete — running final blocking redeem sweep...")
-            try:
-                time.sleep(5)
-                n = sweep_unredeemed_positions()
-                if n:
-                    log.info("Final redeem sweep: claimed %d position(s)", n)
-            except Exception as e:
-                log.warning("Final redeem sweep failed: %s", e)
-            _refresh_wallet()
+            _redeem_all_and_exit()
 
     ws.stop()
     dashboard.update_bot_status(False, cycle, trade_count, 0, mode)
@@ -508,14 +580,6 @@ def _resolve_pending_trades(
     pending_trades: list[PendingTrade],
     tracker: RoundTracker,
 ):
-    """
-    Check each pending trade for resolution.
-
-    Primary: Polymarket Gamma API (check_round_resolution) — gives the
-    authoritative on-chain result.
-    Fallback: If the Gamma API doesn't show resolution yet but the round
-    ended >60s ago, use Chainlink price vs opening price.
-    """
     if not pending_trades:
         return
 
@@ -569,10 +633,6 @@ def _apply_ws_resolutions(
     pending_trades: list[PendingTrade],
     tracker: RoundTracker,
 ):
-    """
-    Instantly resolve pending trades using WebSocket market_resolved events,
-    skipping the Gamma API polling delay entirely.
-    """
     if not ws_events or not pending_trades:
         return
 
@@ -597,10 +657,6 @@ def _apply_ws_resolutions(
 
 
 def _chainlink_fallback_resolution(trade: PendingTrade) -> str | None:
-    """
-    If the Gamma API hasn't reported resolution, compare the current
-    Chainlink price to the opening price as a fallback.
-    """
     try:
         oracle = get_btc_price()
         chainlink = oracle.get("chainlink")
@@ -631,6 +687,7 @@ def _record_resolution(trade: PendingTrade, won: bool, outcome: str):
 
     if won:
         record_bet_result(True, trade.bet_dollars, payout)
+        _won_conditions.append((trade.condition_id, trade.neg_risk))
     else:
         record_bet_result(False, trade.bet_dollars)
 
@@ -639,6 +696,9 @@ def _record_resolution(trade: PendingTrade, won: bool, outcome: str):
         bet_dollars=trade.bet_dollars,
         kelly_fraction=trade.kelly_fraction,
         win_prob=trade.confidence,
+        ruin_prob=trade.ruin_prob,
+        quality_grade=trade.quality_grade,
+        features=trade.features,
     )
 
     br = get_bankroll()
@@ -649,28 +709,22 @@ def _record_resolution(trade: PendingTrade, won: bool, outcome: str):
     result_str = "WIN" if won else "LOSS"
     source = "Gamma API" if outcome in ("up", "down") else f"fallback ({outcome})"
     log.info(
-        "RESOLVED %s: %s %s | outcome=%s (via %s) | "
-        "PnL=$%.4f | Bankroll=$%.2f | Drawdown=%.1f%%",
-        trade.condition_id[:12], result_str, trade.action,
-        outcome, source, pnl, br.current_balance, br.drawdown * 100,
+        "RESOLVED %s: %s [%s] %s | outcome=%s (via %s) | "
+        "PnL=$%.4f | Bankroll=$%.2f | DD=%.1f%% | MaxDD=%.1f%%",
+        trade.condition_id[:12], result_str, trade.quality_grade, trade.action,
+        outcome, source, pnl, br.current_balance,
+        br.drawdown * 100, br.max_drawdown * 100,
     )
     dashboard.add_log(
         "INFO",
-        f"RESOLVED: {trade.action} -> {result_str} (actual={outcome}) "
-        f"pnl=${pnl:.4f} bankroll=${br.current_balance:.2f}",
+        f"RESOLVED: {trade.action} [{trade.quality_grade}] -> {result_str} "
+        f"(actual={outcome}) pnl=${pnl:.4f} bankroll=${br.current_balance:.2f}",
     )
 
 
 # ── Opening price capture ─────────────────────────────────────
 
 def _capture_opening_price(tracker: RoundTracker, rnd: MarketRound):
-    """
-    Record the BTC reference price for this round.
-
-    Priority:
-    1. Extract from market description/question (Polymarket's own ref price)
-    2. Chainlink on-chain price (captured within first 15s of round)
-    """
     if tracker.get_opening_price(rnd.condition_id) is not None:
         return
 
@@ -700,8 +754,6 @@ def _calculate_sleep(
     rounds: list[MarketRound],
     pending_trades: list[PendingTrade],
 ) -> float:
-    """Smart sleep: wake up when the nearest round enters our entry window
-    or when a pending trade might be ready for resolution."""
     global _force_wallet_refresh
     min_sleep = 8.0
 
@@ -740,11 +792,14 @@ def _print_status(cycle: int, rounds: list[MarketRound], pending: list[PendingTr
         return
     stats = risk.stats_summary()
     log.info(
-        "STATUS | trades=%d  wins=%d  losses=%d  win_rate=%.1f%%  "
-        "daily_pnl=$%.4f  total_pnl=$%.4f  pending=%d  consec_losses=%d",
+        "STATUS | trades=%d  wins=%d  losses=%d  wr=%.1f%%  "
+        "daily=$%.4f  total=$%.4f  pending=%d  consec_L=%d  "
+        "sharpe=%.2f  pf=%.2f  kelly_scale=%.2f",
         stats["total_trades"], stats["wins"], stats["losses"],
         stats["win_rate"] * 100, stats["daily_pnl"], stats["total_pnl"],
         len(pending), stats["consecutive_losses"],
+        stats["sharpe_ratio"], stats["profit_factor"],
+        stats["kelly_scale"],
     )
 
 
@@ -752,38 +807,47 @@ def _print_final_stats(pending_trades: list[PendingTrade] | None = None):
     stats = risk.stats_summary()
     br = get_bankroll()
     print()
-    print("=" * 58)
-    print("  FINAL SESSION STATS")
-    print("=" * 58)
+    print("=" * 62)
+    print("  FINAL SESSION STATS (v2)")
+    print("=" * 62)
     print(f"  Total trades:       {stats['total_trades']}")
     print(f"  Wins / Losses:      {stats['wins']} / {stats['losses']}")
     print(f"  Win rate:           {stats['win_rate']*100:.1f}%")
     print(f"  Profit factor:      {stats['profit_factor']:.2f}")
+    print(f"  Expectancy:         ${stats['expectancy']:.4f}/trade")
+    print(f"  Sharpe ratio:       {stats['sharpe_ratio']:.2f}")
     print(f"  Avg edge:           {stats['avg_edge']*100:.2f}%")
     print(f"  Avg Kelly fraction: {stats['avg_kelly']*100:.2f}%")
+    print(f"  Kelly scale:        {stats['kelly_scale']:.2f}")
     print(f"  Daily PnL:          ${stats['daily_pnl']:.4f}")
     print(f"  Total PnL:          ${stats['total_pnl']:.4f}")
-    print(f"  Consecutive losses: {stats['consecutive_losses']}")
+    print(f"  Consec losses:      {stats['consecutive_losses']} (max {stats['max_consecutive_losses']})")
+    print(f"  Session drawdown:   {stats['session_drawdown']*100:.1f}%")
+    grades = stats.get("grade_distribution", {})
+    if any(v > 0 for v in grades.values()):
+        g_str = " ".join(f"{k}:{v}" for k, v in grades.items() if v > 0)
+        print(f"  Grade distribution: {g_str}")
     if pending_trades:
         print(f"  Unresolved trades:  {len(pending_trades)}")
-    print("  " + "-" * 40)
+    print("  " + "-" * 44)
     print(f"  Bankroll:           ${br.current_balance:.2f}")
     print(f"  Starting balance:   ${br.starting_balance:.2f}")
     print(f"  Peak balance:       ${br.peak_balance:.2f}")
     print(f"  Lifetime P&L:       ${br.total_profit:+.2f}")
     print(f"  ROI:                {br.roi*100:+.1f}%")
-    print(f"  Drawdown:           {br.drawdown*100:.1f}%")
+    print(f"  Current drawdown:   {br.drawdown*100:.1f}%")
+    print(f"  Max drawdown:       {br.max_drawdown*100:.1f}%")
     print(f"  Total wagered:      ${br.total_wagered:.2f}")
     print(f"  Fee model:          Polymarket crypto (max 1.56% at 50c)")
+    print(f"  Sizing:             Ruin-calibrated Kelly (target={RUIN_TARGET:.0%})")
     print(f"  Resolution:         REAL (Gamma API + Chainlink)")
-    print("=" * 58)
+    print("=" * 62)
     print()
 
 
 if __name__ == "__main__":
     print_banner()
 
-    # Verify outbound IP is not in a Polymarket-blocked region
     try:
         geo = assert_not_geoblocked()
         print(f"   Geoblock:            PASSED (IP: {geo['ip']} | {geo['region']})")
@@ -797,13 +861,20 @@ if __name__ == "__main__":
         print()
         sys.exit(1)
 
-    # Fetch wallet balances at startup and sync bankroll
     try:
         wb = fetch_wallet_balances()
         sync_bankroll_to_balance(wb["usdc"])
         br = get_bankroll()
         dashboard.update_wallet(wb["address"], wb["usdc"], wb["pol"],
                                 bankroll=br.current_balance)
+        dashboard.update_bankroll_meta(
+            starting=br.starting_balance,
+            peak=br.peak_balance,
+            num_bets=br.num_bets,
+            num_wins=br.num_wins,
+            total_wagered=br.total_wagered,
+            max_drawdown=br.max_drawdown,
+        )
         print(f"   Wallet:              {wb['address'][:8]}...{wb['address'][-6:]}")
         print(f"   USDC balance:        ${wb['usdc']:.4f}")
         print(f"   POL balance:         {wb['pol']:.4f}")
@@ -812,7 +883,6 @@ if __name__ == "__main__":
     except Exception as e:
         log.warning("Wallet balance fetch failed: %s", e)
 
-    # Reconcile on-chain positions with internal state
     try:
         recon = reconcile_bankroll()
         if recon.get("estimated_value_usd") is not None:

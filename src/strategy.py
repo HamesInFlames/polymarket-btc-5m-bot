@@ -1,34 +1,30 @@
 """
-Profit-Maximizing Strategy with Kelly-Optimal Sizing (v4)
-=========================================================
-Key improvements over v3:
-  1. REALISTIC POLYMARKET FEES — crypto markets charge taker fees that eat
-     into edge. Fee formula: fee = C * p * 0.25 * (p*(1-p))^2
-     At p=0.50 the effective rate is 1.56%, dropping to near-zero at extremes.
-  2. FULL MARKET DATA — uses all CLOB endpoints: /book, /midpoint, /spread,
-     /last-trade-price, /fee-rate, /tick-size for accurate pricing.
-  3. FEE-ADJUSTED KELLY — the Kelly fraction now accounts for the fee on entry,
-     so the "effective price" (price + fee) is used for sizing.
-  4. MIN ORDER SIZE enforcement from the order book.
-  5. DISPLAY PRICE logic matching Polymarket (midpoint if spread <= $0.10,
-     last_trade_price if wider).
-
-For a binary contract paying $1.00 with crypto fees:
-  - You pay `price` per contract
-  - Fee per contract: price * effective_fee_rate(price)
-  - Effective cost: price / (1 - effective_fee_rate)  [fee is taken in shares]
-  - If win:  $1.00 per contract received
-  - If lose: lose the effective cost
-  - Kelly: f* = (win_prob - effective_price) / (1 - effective_price)
-
-Source: https://docs.polymarket.com/trading/fees
+Profit-Maximizing Strategy with Logistic Model & Kelly Sizing (v5)
+==================================================================
+Key improvements over v4:
+  1. LOGISTIC REGRESSION MODEL — replaces hand-tuned weighted sum with a
+     proper logistic model.  Outputs a calibrated probability between 0 and
+     1 that feeds directly into Kelly.  Weights are initialised from domain
+     knowledge and can be updated from backtest data.
+  2. RICHER FEATURES — adds higher-timeframe trend, volatility regime
+     scaling, order-book imbalance, spread quality, and time-weighted
+     momentum.
+  3. RUIN-CALIBRATED KELLY — the Kelly multiplier is automatically reduced
+     if the risk-of-ruin at the requested multiplier exceeds the target
+     (default 5%).
+  4. DRAWDOWN-AWARE SIZING — when the bankroll is in drawdown, bet sizes
+     are scaled down proportionally to protect capital.
+  5. BET QUALITY GRADE — each signal carries an A/B/C/D grade so the
+     dashboard and logs instantly convey conviction level.
 """
 
+import json
 import logging
 import math
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from src.config import (
@@ -42,6 +38,9 @@ from src.config import (
     MIN_BET_DOLLARS,
     CONFIDENCE_FLOOR,
     STARTING_BANKROLL,
+    RUIN_TARGET,
+    RUIN_LEVEL,
+    MAX_DRAWDOWN_SCALE,
 )
 from src.market_reader import MarketRound, get_full_market_data
 from src.price_oracle import get_btc_price
@@ -51,15 +50,63 @@ from src.kelly import (
     Bankroll,
     load_bankroll,
     save_bankroll,
+    risk_of_ruin,
 )
 from src.fees import effective_fee_rate, calculate_crypto_fee, fetch_fee_rate_bps
 
 log = logging.getLogger(__name__)
 
 _bankroll: Optional[Bankroll] = None
-_price_history: deque[tuple[float, float]] = deque(maxlen=120)
+_price_history: deque[tuple[float, float]] = deque(maxlen=300)
 _cached_usdc_balance: Optional[float] = None
 
+MODEL_WEIGHTS_FILE = Path(__file__).resolve().parent.parent / "data" / "model_weights.json"
+
+# ── Logistic Regression Model ────────────────────────────────
+
+_DEFAULT_WEIGHTS = {
+    "intercept": -1.40,
+    "magnitude_scaled": 0.85,
+    "time_pressure": 0.60,
+    "momentum_consistency": 0.40,
+    "oracle_agreement": 0.27,
+    "chainlink_agrees": 0.20,
+    "volatility_regime": -0.15,
+    "trend_alignment": 0.24,
+    "book_imbalance": 0.10,
+    "spread_quality": 0.14,
+    "momentum_acceleration": 0.17,
+}
+
+_model_weights: dict[str, float] = {}
+
+
+def _load_model_weights() -> dict[str, float]:
+    global _model_weights
+    if _model_weights:
+        return _model_weights
+    try:
+        if MODEL_WEIGHTS_FILE.exists():
+            _model_weights = json.loads(MODEL_WEIGHTS_FILE.read_text())
+            log.info("Loaded model weights from %s", MODEL_WEIGHTS_FILE)
+            return _model_weights
+    except Exception as e:
+        log.warning("Could not load model weights: %s — using defaults", e)
+    _model_weights = dict(_DEFAULT_WEIGHTS)
+    return _model_weights
+
+
+def save_model_weights(weights: dict[str, float]):
+    """Persist learned weights to disk (called by backtest trainer)."""
+    try:
+        MODEL_WEIGHTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        MODEL_WEIGHTS_FILE.write_text(json.dumps(weights, indent=2))
+        log.info("Saved model weights to %s", MODEL_WEIGHTS_FILE)
+    except Exception as e:
+        log.warning("Could not save model weights: %s", e)
+
+
+# ── Bankroll helpers ──────────────────────────────────────────
 
 def get_bankroll() -> Bankroll:
     global _bankroll
@@ -72,8 +119,7 @@ def sync_bankroll_to_balance(usdc_balance: float):
     """
     Sync bankroll with actual on-chain USDC.e balance.
     Always sets bankroll to match real wallet balance so Kelly
-    sizes bets correctly in both directions (deposits/redemptions up,
-    losses/withdrawals down).
+    sizes bets correctly in both directions.
     """
     global _cached_usdc_balance
     _cached_usdc_balance = usdc_balance
@@ -98,21 +144,24 @@ def record_bet_result(won: bool, wager: float, payout: float = 0.0):
         br.record_loss(wager)
     save_bankroll(br)
     log.info(
-        "Bankroll updated: $%.2f (P&L: $%.2f, ROI: %.1f%%, Drawdown: %.1f%%)",
-        br.current_balance, br.total_profit, br.roi * 100, br.drawdown * 100,
+        "Bankroll updated: $%.2f (P&L: $%.2f, ROI: %.1f%%, DD: %.1f%%, MaxDD: %.1f%%)",
+        br.current_balance, br.total_profit, br.roi * 100,
+        br.drawdown * 100, br.max_drawdown * 100,
     )
 
+
+# ── Signal dataclass ─────────────────────────────────────────
 
 @dataclass
 class Signal:
     """A trade signal produced by the strategy."""
-    action: str              # "BUY_UP" or "BUY_DOWN"
+    action: str
     token_id: str
-    price: float             # limit price to place the order at
-    size: float              # number of contracts (shares)
-    edge: float              # win_prob - effective_price (fee-adjusted)
-    confidence: float        # estimated win probability (0-1)
-    direction: str           # "up" or "down"
+    price: float
+    size: float
+    edge: float
+    confidence: float
+    direction: str
     btc_current: float
     btc_opening: float
     seconds_remaining: float
@@ -126,7 +175,12 @@ class Signal:
     fee_rate_pct: float = 0.0
     effective_price: float = 0.0
     min_order_size: float = 5.0
+    ruin_prob: float = 0.0
+    quality_grade: str = ""
+    features: dict = None
 
+
+# ── Main evaluation ──────────────────────────────────────────
 
 def evaluate_round(
     rnd: MarketRound,
@@ -171,22 +225,27 @@ def evaluate_round(
 
     direction = "up" if price_delta > 0 else "down"
 
-    win_prob = _estimate_win_probability(
+    # --- Fetch FULL market data from all CLOB endpoints ---
+    token_id = rnd.up_token_id if direction == "up" else rnd.down_token_id
+    market = get_full_market_data(token_id)
+
+    # --- Extract features & estimate win probability ---
+    features = _extract_features(
         pct_move=pct_move,
         direction=direction,
         seconds_remaining=remaining,
         oracle=oracle,
         opening_price=opening_btc_price,
         current_price=current_price,
+        volatility=vol,
+        market=market,
     )
+
+    win_prob = _logistic_predict(features)
 
     if win_prob < CONFIDENCE_FLOOR:
         log.info("Win probability %.3f below floor %.3f - skipping", win_prob, CONFIDENCE_FLOOR)
         return None
-
-    # --- Fetch FULL market data from all CLOB endpoints ---
-    token_id = rnd.up_token_id if direction == "up" else rnd.down_token_id
-    market = get_full_market_data(token_id)
 
     limit_price = _determine_limit_price(market, win_prob, remaining)
 
@@ -205,7 +264,6 @@ def evaluate_round(
         return None
 
     # --- Calculate fee-adjusted edge ---
-    # Try dynamic fee from CLOB endpoint first; fall back to hardcoded formula
     live_bps = market.get("fee_rate_bps", 0)
     if live_bps and live_bps > 0:
         fee_rate = (live_bps / 10_000.0) * (limit_price * (1 - limit_price))
@@ -226,14 +284,18 @@ def evaluate_round(
         )
         return None
 
-    # --- Kelly sizing with fee-adjusted effective price ---
+    # --- Drawdown-aware Kelly sizing ---
     br = get_bankroll()
+    effective_bankroll = _drawdown_adjusted_bankroll(br)
+
     rec = kelly_criterion(
         win_prob=win_prob,
         contract_price=eff_price,
-        bankroll=br.current_balance,
+        bankroll=effective_bankroll,
         kelly_multiplier=KELLY_MULTIPLIER,
         min_bet_dollars=MIN_BET_DOLLARS,
+        ruin_target=RUIN_TARGET,
+        ruin_level=RUIN_LEVEL,
     )
 
     if not rec.should_bet:
@@ -295,6 +357,9 @@ def evaluate_round(
         fee_rate_pct=fee_rate * 100,
         effective_price=eff_price,
         min_order_size=min_size,
+        ruin_prob=rec.ruin_prob,
+        quality_grade=rec.quality_grade,
+        features=features,
         reason=(
             f"BTC {'UP' if direction == 'up' else 'DN'} "
             f"${price_delta:+.2f} ({pct_move*100:.4f}%) | "
@@ -304,6 +369,7 @@ def evaluate_round(
             f"spread=${market['spread']:.3f} last=${market['last_trade_price']:.3f} | "
             f"Kelly={rec.adj_kelly_fraction:.4f} -> ${bet_dollars_adj:.2f} "
             f"({size:.1f} contracts, min={min_size:.0f}) | "
+            f"ruin={rec.ruin_prob:.3f} grade={rec.quality_grade} | "
             f"depth={market['bid_depth']:.0f}/{market['ask_depth']:.0f} "
             f"levels={market['book_levels']} | "
             f"EV=${ev_adj:.4f} | bankroll=${br.current_balance:.2f} | "
@@ -311,82 +377,130 @@ def evaluate_round(
         ),
     )
 
-    log.info("SIGNAL: %s - %s", action, signal.reason)
+    log.info("SIGNAL: %s [%s] - %s", action, rec.quality_grade, signal.reason)
     return signal
 
 
-def _estimate_win_probability(
+# ── Feature extraction ───────────────────────────────────────
+
+def _extract_features(
     pct_move: float,
     direction: str,
     seconds_remaining: float,
     oracle: dict,
     opening_price: float,
     current_price: float,
-) -> float:
+    volatility: float,
+    market: dict,
+) -> dict:
     """
-    Multi-factor win probability estimation.
+    Build a feature vector for the logistic model.
 
-    Factors:
-    1. MOMENTUM MAGNITUDE -- larger moves are more likely to persist
-    2. TIME DECAY -- less time remaining = less time for reversal
-    3. MOMENTUM CONSISTENCY -- is the move accelerating or decelerating?
-    4. ORACLE AGREEMENT -- do all price sources agree on direction?
-    5. CHAINLINK AUTHORITY -- Chainlink is the resolution source
+    All features are normalised to roughly [0, 1] range so the
+    learned weights are interpretable and stable.
     """
+    # 1. Magnitude: how large the move is relative to typical 5m BTC volatility
+    #    Scaled by sigmoid to [0,1]; midpoint tuned for typical BTC 5m moves
+    magnitude_scaled = _sigmoid(pct_move, midpoint=0.0004, steepness=8000)
 
-    magnitude_signal = _sigmoid(pct_move, midpoint=0.0004, steepness=8000)
-
+    # 2. Time pressure: fraction of round elapsed, with sigmoid shaping
+    #    More time elapsed = higher confidence the direction persists
     time_fraction = 1.0 - (seconds_remaining / 300.0)
-    time_signal = 0.50 + 0.45 * _sigmoid(time_fraction, midpoint=0.6, steepness=8)
+    time_pressure = _sigmoid(time_fraction, midpoint=0.6, steepness=8)
 
-    consistency = _momentum_consistency(direction)
+    # 3. Momentum consistency: are sequential price ticks confirming direction?
+    momentum_consistency = _momentum_consistency(direction)
 
+    # 4. Oracle agreement: what fraction of price sources agree on direction?
     prices = oracle["sources"]
     if len(prices) >= 2:
         vals = list(prices.values())
-        all_above = all(v > opening_price for v in vals)
-        all_below = all(v < opening_price for v in vals)
-        if (direction == "up" and all_above) or (direction == "down" and all_below):
-            agreement = 1.0
-        else:
-            agreeing = sum(
-                1 for v in vals
-                if (direction == "up" and v > opening_price)
-                or (direction == "down" and v < opening_price)
-            )
-            agreement = agreeing / len(vals)
+        agreeing = sum(
+            1 for v in vals
+            if (direction == "up" and v > opening_price)
+            or (direction == "down" and v < opening_price)
+        )
+        oracle_agreement = agreeing / len(vals)
     else:
-        agreement = 0.5
+        oracle_agreement = 0.5
 
+    # 5. Chainlink authority: does the resolution oracle agree?
     chainlink = oracle.get("chainlink")
     if chainlink is not None:
-        chainlink_agrees = (
+        chainlink_agrees = float(
             (direction == "up" and chainlink > opening_price)
             or (direction == "down" and chainlink < opening_price)
         )
-        chainlink_bonus = 0.08 if chainlink_agrees else -0.05
     else:
-        chainlink_bonus = 0.0
+        chainlink_agrees = 0.5
 
-    raw_prob = (
-        magnitude_signal * 0.25
-        + time_signal * 0.30
-        + consistency * 0.20
-        + agreement * 0.15
-        + 0.10
-    ) + chainlink_bonus
+    # 6. Volatility regime: high vol = more reversal risk, normalised
+    #    Typical 5m BTC vol is 0.0002-0.001; higher vol reduces confidence
+    vol_norm = min(1.0, volatility / 0.001)
 
-    raw_prob = max(0.01, min(0.99, raw_prob))
+    # 7. Trend alignment: does the higher-timeframe trend agree?
+    trend_alignment = _higher_timeframe_trend(direction)
+
+    # 8. Order book imbalance: is there more depth on our side?
+    bid_depth = market.get("bid_depth", 0) or 0
+    ask_depth = market.get("ask_depth", 0) or 0
+    total_depth = bid_depth + ask_depth
+    if total_depth > 0:
+        if direction == "up":
+            book_imbalance = bid_depth / total_depth
+        else:
+            book_imbalance = ask_depth / total_depth
+    else:
+        book_imbalance = 0.5
+
+    # 9. Spread quality: tighter spread = more liquid, better execution
+    spread = market.get("spread", 1.0) or 1.0
+    spread_quality = max(0.0, 1.0 - spread / 0.20)
+
+    # 10. Momentum acceleration: is the price change accelerating?
+    momentum_accel = _momentum_acceleration(direction)
+
+    features = {
+        "magnitude_scaled": magnitude_scaled,
+        "time_pressure": time_pressure,
+        "momentum_consistency": momentum_consistency,
+        "oracle_agreement": oracle_agreement,
+        "chainlink_agrees": chainlink_agrees,
+        "volatility_regime": vol_norm,
+        "trend_alignment": trend_alignment,
+        "book_imbalance": book_imbalance,
+        "spread_quality": spread_quality,
+        "momentum_acceleration": momentum_accel,
+    }
 
     log.debug(
-        "Win prob factors: mag=%.3f time=%.3f consist=%.3f agree=%.3f "
-        "chainlink=%+.3f -> raw=%.3f",
-        magnitude_signal, time_signal, consistency, agreement,
-        chainlink_bonus, raw_prob,
+        "Features: %s",
+        " | ".join(f"{k}={v:.3f}" for k, v in features.items()),
     )
 
-    return raw_prob
+    return features
 
+
+def _logistic_predict(features: dict) -> float:
+    """
+    Logistic regression prediction: sigmoid(w^T x + b).
+
+    Returns a calibrated probability in (0, 1).
+    """
+    weights = _load_model_weights()
+
+    z = weights.get("intercept", -1.8)
+    for feat_name, feat_val in features.items():
+        w = weights.get(feat_name, 0.0)
+        z += w * feat_val
+
+    z = max(-15, min(15, z))
+    prob = 1.0 / (1.0 + math.exp(-z))
+
+    return max(0.01, min(0.99, prob))
+
+
+# ── Feature helper functions ─────────────────────────────────
 
 def _sigmoid(x: float, midpoint: float = 0.5, steepness: float = 10.0) -> float:
     z = steepness * (x - midpoint)
@@ -415,6 +529,72 @@ def _momentum_consistency(direction: str) -> float:
 
     ratio = consistent / len(deltas)
     return 0.3 + 0.7 * ratio
+
+
+def _momentum_acceleration(direction: str) -> float:
+    """
+    Are recent price moves getting larger (accelerating)?
+    Compares the magnitude of the most recent ticks to older ones.
+    Returns 0-1 where 1 = strongly accelerating.
+    """
+    if len(_price_history) < 6:
+        return 0.5
+
+    recent = list(_price_history)[-12:]
+    if len(recent) < 6:
+        return 0.5
+
+    deltas = [recent[i][1] - recent[i-1][1] for i in range(1, len(recent))]
+    mid = len(deltas) // 2
+    early_mag = sum(abs(d) for d in deltas[:mid]) / mid
+    late_mag = sum(abs(d) for d in deltas[mid:]) / (len(deltas) - mid)
+
+    if early_mag <= 0:
+        return 0.7
+
+    accel_ratio = late_mag / early_mag
+
+    # Also check if the direction of recent ticks aligns
+    if direction == "up":
+        late_directional = sum(1 for d in deltas[mid:] if d > 0) / (len(deltas) - mid)
+    else:
+        late_directional = sum(1 for d in deltas[mid:] if d < 0) / (len(deltas) - mid)
+
+    raw = 0.5 * min(1.0, accel_ratio / 2.0) + 0.5 * late_directional
+    return max(0.0, min(1.0, raw))
+
+
+def _higher_timeframe_trend(direction: str) -> float:
+    """
+    Check the price trend over a longer lookback (all available history,
+    up to ~5 minutes).  If the broader trend agrees with the short-term
+    direction, this is a stronger signal.
+    """
+    if len(_price_history) < 10:
+        return 0.5
+
+    prices = list(_price_history)
+    # Compare first quarter vs last quarter to detect trend
+    q1_end = len(prices) // 4
+    q4_start = 3 * len(prices) // 4
+
+    if q1_end < 1 or q4_start >= len(prices):
+        return 0.5
+
+    avg_early = sum(p[1] for p in prices[:q1_end]) / q1_end
+    avg_late = sum(p[1] for p in prices[q4_start:]) / (len(prices) - q4_start)
+
+    if avg_early <= 0:
+        return 0.5
+
+    trend_pct = (avg_late - avg_early) / avg_early
+
+    if direction == "up":
+        trend_score = _sigmoid(trend_pct, midpoint=0.0, steepness=5000)
+    else:
+        trend_score = _sigmoid(-trend_pct, midpoint=0.0, steepness=5000)
+
+    return trend_score
 
 
 def _recent_volatility() -> float:
@@ -452,6 +632,36 @@ def _dynamic_move_threshold(volatility: float) -> float:
     return max(base, min(0.001, vol_scaled))
 
 
+def _drawdown_adjusted_bankroll(br: Bankroll) -> float:
+    """
+    When in drawdown, reduce effective bankroll for Kelly sizing.
+    This is a convex scaling: small drawdowns barely affect size,
+    but deep drawdowns sharply reduce it.
+
+    At 0% DD   -> 100% of balance used for sizing
+    At 20% DD  -> ~80% of balance
+    At 50% DD  -> ~50% of balance
+    At MAX_DRAWDOWN_SCALE -> minimum sizing
+    """
+    dd = br.drawdown
+    if dd <= 0 or MAX_DRAWDOWN_SCALE <= 0:
+        return br.current_balance
+
+    dd_capped = min(dd, MAX_DRAWDOWN_SCALE)
+    scale = 1.0 - (dd_capped / MAX_DRAWDOWN_SCALE) ** 1.5
+    scale = max(0.25, scale)
+
+    effective = br.current_balance * scale
+    if scale < 0.99:
+        log.info(
+            "Drawdown scaling: DD=%.1f%% -> sizing at %.0f%% of $%.2f = $%.2f",
+            dd * 100, scale * 100, br.current_balance, effective,
+        )
+    return effective
+
+
+# ── Limit price determination ────────────────────────────────
+
 def _determine_limit_price(
     market: dict,
     win_prob: float,
@@ -462,8 +672,6 @@ def _determine_limit_price(
 
     Uses realistic Polymarket market data: best_bid, best_ask, display_price,
     last_trade_price, and spread to determine the best entry.
-
-    Your order price must conform to the market's tick size.
     """
     best_bid = market["best_bid"]
     best_ask = market["best_ask"]

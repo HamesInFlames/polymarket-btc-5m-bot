@@ -52,15 +52,33 @@ MAX_CONTRACT_PRICE: float = _float("MAX_CONTRACT_PRICE", 0.95)
 MAX_TRADE_SIZE: float = _float("MAX_TRADE_SIZE", 10.0)
 LIVE_TRADING: bool = _bool("LIVE_TRADING", False)
 
+# ── Risk controls ─────────────────────────────────────────────
 MAX_DAILY_LOSS: float = _float("MAX_DAILY_LOSS", 20.0)
 MAX_CONSECUTIVE_LOSSES: int = _int("MAX_CONSECUTIVE_LOSSES", 5)
+MAX_DRAWDOWN_HALT: float = _float("MAX_DRAWDOWN_HALT", 0.30)
+KELLY_COOLDOWN_LOSSES: int = _int("KELLY_COOLDOWN_LOSSES", 3)
+KELLY_COOLDOWN_SCALE: float = _float("KELLY_COOLDOWN_SCALE", 0.70)
+MAX_DRAWDOWN_HALT: float = _float("MAX_DRAWDOWN_HALT", 0.40)
+
+# After this many consecutive losses, start reducing Kelly multiplier
+KELLY_COOLDOWN_LOSSES: int = _int("KELLY_COOLDOWN_LOSSES", 3)
+# Each additional loss beyond the threshold multiplies Kelly by this factor
+KELLY_COOLDOWN_SCALE: float = _float("KELLY_COOLDOWN_SCALE", 0.65)
 
 # ── Kelly / Bankroll parameters ───────────────────────────────
 STARTING_BANKROLL: float = _float("STARTING_BANKROLL", 33.69)
-KELLY_MULTIPLIER: float = _float("KELLY_MULTIPLIER", 0.50)
+KELLY_MULTIPLIER: float = _float("KELLY_MULTIPLIER", 0.25)
 MIN_BET_DOLLARS: float = _float("MIN_BET_DOLLARS", 2.50)
 VOLATILITY_LOOKBACK: int = _int("VOLATILITY_LOOKBACK", 20)
 CONFIDENCE_FLOOR: float = _float("CONFIDENCE_FLOOR", 0.55)
+
+# ── Ruin / drawdown calibration ──────────────────────────────
+# Maximum acceptable probability of ruin (bankroll -> ruin_level)
+RUIN_TARGET: float = _float("RUIN_TARGET", 0.05)
+# Fraction of bankroll that constitutes "ruin"
+RUIN_LEVEL: float = _float("RUIN_LEVEL", 0.10)
+# At this drawdown level, sizing is scaled to minimum
+MAX_DRAWDOWN_SCALE: float = _float("MAX_DRAWDOWN_SCALE", 0.50)
 
 # ── External price APIs (fallbacks) ──────────────────────────
 BINANCE_BTC_URL = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
