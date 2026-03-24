@@ -153,7 +153,25 @@ def place_buy_order(
 
     except Exception as e:
         error_str = str(e)
-        if "425" in error_str or "Too Early" in error_str:
+        lower_err = error_str.lower()
+        if "403" in error_str and ("region" in lower_err or "restricted" in lower_err or "geoblock" in lower_err):
+            log.critical(
+                "GEOBLOCKED by Polymarket CLOB! Order rejected with 403.\n"
+                "  Your VPN IP is blocked at the TRADING level.\n"
+                "  Switch NordVPN to: Portugal, Germany, Poland, Singapore, etc.\n"
+                "  Canada (all), US, UK, Australia, France are blocked.\n"
+                "  Error: %s", error_str[:300],
+            )
+            return FillResult(
+                success=False,
+                order_id="",
+                status="GEOBLOCKED",
+                requested_size=size,
+                filled_size=0.0,
+                avg_price=0.0,
+                is_live=True,
+            )
+        elif "425" in error_str or "Too Early" in error_str:
             log.warning("Matching engine restarting (425) — order not placed")
             from src.http_client import _signal_engine_restart
             _signal_engine_restart()

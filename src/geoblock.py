@@ -1,9 +1,13 @@
 """
-Geoblock checker — calls Polymarket's /api/geoblock endpoint to verify
-the bot's outbound IP is not in a restricted region before trading.
+Geoblock checker — verifies the bot's outbound IP is not blocked by BOTH:
+  1. Polymarket website (/api/geoblock)
+  2. CLOB trading API (attempts API key derivation — returns 403 if blocked)
+
+The CLOB has stricter geoblocking than the website. The website may allow
+certain regions (e.g., Quebec, Canada) while the CLOB blocks all of Canada
+at the trading level.
 
 Reference: https://docs.polymarket.com (geographic restrictions)
-Endpoint:  GET https://polymarket.com/api/geoblock
 """
 
 import logging
@@ -14,20 +18,30 @@ import requests
 log = logging.getLogger(__name__)
 
 GEOBLOCK_URL = "https://polymarket.com/api/geoblock"
+CLOB_HOST = "https://clob.polymarket.com"
 IP_INFO_URL = "https://ipinfo.io/json"
 
 
 def check_geoblock(timeout: int = 10) -> dict:
     """
-    Query Polymarket's geoblock endpoint and return the raw response.
+    Query both Polymarket's website geoblock AND the CLOB trading endpoint.
 
-    Returns a dict with at minimum:
+    Returns a dict with:
         - "allowed": bool   (True = trading permitted from this IP)
-        - "ip": str         (detected public IP, if available)
-        - "region": str     (detected region/country, if available)
-        - "raw": dict       (full API response for debugging)
+        - "ip": str         (detected public IP)
+        - "region": str     (detected region/country)
+        - "website_allowed": bool  (website geoblock result)
+        - "clob_allowed": bool     (CLOB trading geoblock result)
+        - "raw": dict              (full API response for debugging)
     """
-    result = {"allowed": True, "ip": "unknown", "region": "unknown", "raw": {}}
+    result = {
+        "allowed": True,
+        "ip": "unknown",
+        "region": "unknown",
+        "website_allowed": True,
+        "clob_allowed": True,
+        "raw": {},
+    }
 
     ip_info = _get_ip_info(timeout)
     if ip_info:
@@ -37,31 +51,85 @@ def check_geoblock(timeout: int = 10) -> dict:
         country = ip_info.get("country", "")
         result["region"] = f"{city}, {region}, {country}".strip(", ")
 
+    # Check 1: Website geoblock
     try:
         resp = requests.get(GEOBLOCK_URL, timeout=timeout)
-
         if resp.status_code == 200:
             data = resp.json()
-            result["raw"] = data
+            result["raw"]["website"] = data
             blocked = data.get("blocked", False)
             if isinstance(blocked, str):
                 blocked = blocked.lower() in ("true", "1", "yes")
-            result["allowed"] = not blocked
+            result["website_allowed"] = not blocked
         elif resp.status_code == 403:
-            result["allowed"] = False
-            result["raw"] = {"status": 403, "reason": "Forbidden"}
-        else:
-            log.warning(
-                "Geoblock check returned HTTP %d — assuming allowed (cannot confirm)",
-                resp.status_code,
-            )
-            result["raw"] = {"status": resp.status_code}
-
+            result["website_allowed"] = False
+            result["raw"]["website"] = {"status": 403}
     except requests.exceptions.RequestException as e:
-        log.warning("Geoblock check failed (network error): %s — assuming allowed", e)
-        result["raw"] = {"error": str(e)}
+        log.warning("Website geoblock check failed: %s", e)
+        result["raw"]["website"] = {"error": str(e)}
 
+    # Check 2: CLOB trading endpoint — try to derive API creds
+    # If the CLOB blocks our region, it returns 403 on auth endpoints
+    clob_blocked = _check_clob_geoblock(timeout)
+    result["clob_allowed"] = not clob_blocked
+    result["raw"]["clob_blocked"] = clob_blocked
+
+    result["allowed"] = result["website_allowed"] and result["clob_allowed"]
     return result
+
+
+def _check_clob_geoblock(timeout: int = 10) -> bool:
+    """
+    Test if the CLOB trading API blocks our IP on authenticated endpoints.
+    Uses real API credentials (derived from the private key) to send
+    an authenticated request — the geoblock only fires on authenticated
+    trading requests.
+    Returns True if blocked, False if allowed.
+    """
+    try:
+        from src.config import PRIVATE_KEY, CHAIN_ID
+        if not PRIVATE_KEY:
+            log.debug("No PRIVATE_KEY — skipping CLOB geoblock probe")
+            return False
+
+        from py_clob_client.client import ClobClient
+
+        client = ClobClient(
+            host=CLOB_HOST,
+            key=PRIVATE_KEY,
+            chain_id=CHAIN_ID,
+        )
+        creds = client.create_or_derive_api_creds()
+
+        from eth_account import Account
+        wallet = Account.from_key(PRIVATE_KEY).address
+
+        auth_client = ClobClient(
+            host=CLOB_HOST,
+            key=PRIVATE_KEY,
+            chain_id=CHAIN_ID,
+            creds=creds,
+            signature_type=0,
+            funder=wallet,
+        )
+
+        # Fetch open orders — this is an authenticated GET that triggers
+        # the geoblock on the trading API path
+        try:
+            auth_client.get_orders()
+            return False  # If it succeeds, we're not blocked
+        except Exception as e:
+            error_str = str(e)
+            if "403" in error_str and ("region" in error_str.lower() or "restricted" in error_str.lower() or "geoblock" in error_str.lower()):
+                log.warning("CLOB trading API geoblock detected: %s", error_str[:200])
+                return True
+            # Other errors (network, auth) don't mean geoblock
+            log.debug("CLOB probe got non-geoblock error: %s", error_str[:100])
+            return False
+
+    except Exception as e:
+        log.debug("CLOB geoblock probe failed: %s", e)
+        return False
 
 
 def _get_ip_info(timeout: int = 5) -> Optional[dict]:
@@ -77,31 +145,58 @@ def _get_ip_info(timeout: int = 5) -> Optional[dict]:
 
 def assert_not_geoblocked() -> dict:
     """
-    Run the geoblock check and raise RuntimeError if blocked.
+    Run both geoblock checks and raise RuntimeError if blocked.
     Returns the check result on success.
     """
     result = check_geoblock()
 
     if result["allowed"]:
         log.info(
-            "Geoblock check PASSED — IP: %s | Region: %s",
+            "Geoblock check PASSED — IP: %s | Region: %s | Website: %s | CLOB: %s",
             result["ip"], result["region"],
+            "OK" if result["website_allowed"] else "BLOCKED",
+            "OK" if result["clob_allowed"] else "BLOCKED",
         )
         return result
+
+    # Determine which system is blocking
+    if not result["clob_allowed"] and result["website_allowed"]:
+        detail = (
+            "  The Polymarket WEBSITE allows your IP, but the CLOB TRADING\n"
+            "  API blocks it. The CLOB has STRICTER geoblocking — it may\n"
+            "  block entire countries (like all of Canada) even though the\n"
+            "  website only blocks specific provinces (like Ontario).\n"
+        )
+    elif not result["website_allowed"]:
+        detail = (
+            "  Both the Polymarket website and CLOB trading API block your IP.\n"
+        )
+    else:
+        detail = ""
 
     msg = (
         f"GEOBLOCKED by Polymarket!\n"
         f"  Detected IP:     {result['ip']}\n"
         f"  Detected region: {result['region']}\n"
+        f"  Website:         {'ALLOWED' if result['website_allowed'] else 'BLOCKED'}\n"
+        f"  CLOB trading:    {'ALLOWED' if result['clob_allowed'] else 'BLOCKED'}\n"
         f"\n"
-        f"  Polymarket blocks trading from this location.\n"
-        f"  If you're using a VPN, make sure it's connected to a\n"
-        f"  non-blocked server (e.g., Montreal/Quebec, NOT Ontario).\n"
+        f"{detail}"
         f"\n"
-        f"  NordVPN fix: open NordVPN -> click the map or server list\n"
-        f"  -> pick 'Montreal' or 'Quebec' specifically, NOT 'Canada'\n"
-        f"  (auto-select often picks Ontario servers).\n"
+        f"  To fix: connect your VPN to a non-restricted country.\n"
+        f"  Countries known to work: Portugal, Germany, Poland, Singapore,\n"
+        f"  Switzerland, Japan, South Korea, Netherlands, etc.\n"
         f"\n"
-        f"  Raw response: {result['raw']}"
+        f"  Countries known to be BLOCKED:\n"
+        f"    - Canada (entire country on CLOB, Ontario on website)\n"
+        f"    - United States (some/all)\n"
+        f"    - United Kingdom\n"
+        f"    - Australia\n"
+        f"    - France\n"
+        f"\n"
+        f"  NordVPN: open app -> server list -> pick a country like\n"
+        f"  'Portugal', 'Germany', 'Poland', or 'Singapore'.\n"
+        f"\n"
+        f"  Raw: {result['raw']}"
     )
     raise RuntimeError(msg)
