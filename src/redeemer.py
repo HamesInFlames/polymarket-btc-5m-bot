@@ -192,3 +192,54 @@ def check_pol_balance() -> float:
         return float(w3.from_wei(bal_wei, "ether"))
     except Exception:
         return 0.0
+
+
+ERC20_BALANCE_ABI = [
+    {
+        "name": "balanceOf",
+        "type": "function",
+        "inputs": [{"name": "account", "type": "address"}],
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+    },
+    {
+        "name": "decimals",
+        "type": "function",
+        "inputs": [],
+        "outputs": [{"name": "", "type": "uint8"}],
+        "stateMutability": "view",
+    },
+]
+
+
+def fetch_wallet_balances(address: str | None = None) -> dict:
+    """
+    Fetch USDC.e and POL balances for a wallet address on Polygon.
+
+    Returns dict with keys: address, usdc, pol.
+    """
+    from src.config import WALLET_ADDRESS
+    addr = address or WALLET_ADDRESS
+    if not addr:
+        return {"address": "", "usdc": 0.0, "pol": 0.0}
+
+    try:
+        w3, _ = _get_web3()
+        checksum = Web3.to_checksum_address(addr)
+
+        pol_wei = w3.eth.get_balance(checksum)
+        pol = float(w3.from_wei(pol_wei, "ether"))
+
+        usdc_contract = w3.eth.contract(
+            address=Web3.to_checksum_address(USDC_ADDRESS),
+            abi=ERC20_BALANCE_ABI,
+        )
+        usdc_raw = usdc_contract.functions.balanceOf(checksum).call()
+        usdc = usdc_raw / 1e6  # USDC.e has 6 decimals
+
+        log.info("Wallet %s — USDC: $%.4f  POL: %.4f", addr[:10], usdc, pol)
+        return {"address": addr, "usdc": usdc, "pol": pol}
+
+    except Exception as e:
+        log.warning("Failed to fetch wallet balances for %s: %s", addr[:10], e)
+        return {"address": addr, "usdc": 0.0, "pol": 0.0}

@@ -27,6 +27,9 @@ CHAIN_ID: int = 137
 CLOB_HOST: str = "https://clob.polymarket.com"
 GAMMA_HOST: str = "https://gamma-api.polymarket.com"
 
+# ── Wallet ────────────────────────────────────────────────────
+WALLET_ADDRESS: str = os.getenv("WALLET_ADDRESS", "0x96418edEc291543e0e7Cb2Ef90aEEb050B2E05d1")
+
 # ── Contract addresses (Polygon) ─────────────────────────────
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"

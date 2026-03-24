@@ -45,7 +45,7 @@ from src.risk_manager import RiskManager
 from src.trader import place_buy_order, FillResult
 from src.fees import effective_fee_rate
 from src.bot_state import state as dashboard, TradeEntry, install_log_handler
-from src.redeemer import redeem_winning_position, check_pol_balance
+from src.redeemer import redeem_winning_position, check_pol_balance, fetch_wallet_balances
 from src.geoblock import assert_not_geoblocked, check_geoblock
 from src.ws_client import get_ws_client
 from src.data_api import reconcile_bankroll
@@ -182,12 +182,23 @@ def main_loop():
     ws.start()
     log.info("WebSocket market data client started")
 
+    _wallet_refresh_interval = 30
+    _last_wallet_cycle = -_wallet_refresh_interval
+
     while not _shutdown:
         cycle += 1
         dashboard.update_bot_status(True, cycle, trade_count, 0, mode)
 
         allowed, risk_reason = risk.pre_trade_check()
         dashboard.update_risk_stats(risk.stats_summary())
+
+        if cycle - _last_wallet_cycle >= _wallet_refresh_interval:
+            _last_wallet_cycle = cycle
+            try:
+                wb = fetch_wallet_balances()
+                dashboard.update_wallet(wb["address"], wb["usdc"], wb["pol"])
+            except Exception as e:
+                log.debug("Wallet balance fetch failed: %s", e)
 
         log.info(
             "-- Cycle %d  [trades: %d | pending: %d] -------------------------",
@@ -644,6 +655,18 @@ if __name__ == "__main__":
         print("!" * 62)
         print()
         sys.exit(1)
+
+    # Fetch wallet balances at startup
+    try:
+        wb = fetch_wallet_balances()
+        dashboard.update_wallet(wb["address"], wb["usdc"], wb["pol"])
+        print(f"   Wallet:              {wb['address'][:8]}...{wb['address'][-6:]}")
+        print(f"   USDC balance:        ${wb['usdc']:.4f}")
+        print(f"   POL balance:         {wb['pol']:.4f}")
+        print("=" * 62)
+        print()
+    except Exception as e:
+        log.warning("Wallet balance fetch failed: %s", e)
 
     # Reconcile on-chain positions with internal state
     try:

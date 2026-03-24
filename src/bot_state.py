@@ -58,6 +58,11 @@ class BotState:
         self.last_error_at: float = 0.0
         self.log_lines: list[dict] = []
 
+        self.wallet_address: str = ""
+        self.wallet_usdc: float = 0.0
+        self.wallet_pol: float = 0.0
+        self.wallet_updated_at: float = 0.0
+
     def update_bot_status(self, running: bool, cycle: int, trade_count: int,
                           max_trades: int, mode: str):
         with self._lock:
@@ -122,6 +127,13 @@ class BotState:
             self.consecutive_losses = stats.get("consecutive_losses", 0)
             self.paused = stats.get("paused", False)
             self.pause_reason = stats.get("pause_reason", "")
+
+    def update_wallet(self, address: str, usdc: float, pol: float):
+        with self._lock:
+            self.wallet_address = address
+            self.wallet_usdc = usdc
+            self.wallet_pol = pol
+            self.wallet_updated_at = time.time()
 
     def set_error(self, error: str):
         with self._lock:
@@ -188,6 +200,12 @@ class BotState:
                     for t in self.trades[-50:]
                 ],
                 "logs": self.log_lines[-80:],
+                "wallet": {
+                    "address": self.wallet_address,
+                    "usdc": self.wallet_usdc,
+                    "pol": self.wallet_pol,
+                    "updated_at": self.wallet_updated_at,
+                },
                 "error": {
                     "message": self.last_error,
                     "at": self.last_error_at,
