@@ -24,7 +24,7 @@ import logging
 import signal
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from src.config import (
     LIVE_TRADING,
@@ -45,9 +45,12 @@ from src.risk_manager import RiskManager
 from src.trader import place_buy_order, FillResult
 from src.fees import effective_fee_rate
 from src.bot_state import state as dashboard, TradeEntry, install_log_handler
-from src.redeemer import redeem_winning_position, check_pol_balance, fetch_wallet_balances, set_redeem_callback
+from src.redeemer import (
+    fetch_wallet_balances,
+    sweep_unredeemed_positions,
+)
 from src.geoblock import (
-    assert_not_geoblocked, check_geoblock,
+    assert_not_geoblocked,
     is_clob_geoblocked, clob_geoblock_status,
     probe_clob_trading, clear_clob_geoblock, signal_clob_geoblock,
     SAFE_COUNTRIES,
@@ -192,17 +195,6 @@ def _refresh_wallet(force_increase: bool = False):
         return False
 
 
-def _on_redeem_complete(condition_id: str, success: bool):
-    """Callback fired by background redeem thread when tx confirms."""
-    global _force_wallet_refresh
-    if success:
-        log.info("Redeem confirmed for %s — flagging wallet refresh", condition_id[:12])
-        _force_wallet_refresh = True
-    else:
-        log.warning("Redeem failed for %s — flagging wallet refresh anyway", condition_id[:12])
-        _force_wallet_refresh = True
-
-
 def main_loop():
     global _force_wallet_refresh
 
@@ -217,8 +209,6 @@ def main_loop():
     ws = get_ws_client()
     ws.start()
     log.info("WebSocket market data client started")
-
-    set_redeem_callback(_on_redeem_complete)
 
     _ws_resolutions: list[tuple[str, str]] = []
     _ws_res_lock = __import__("threading").Lock()
@@ -467,6 +457,22 @@ def main_loop():
             _last_wallet_refresh_time = time.time()
             _refresh_wallet()
 
+        # ── Phase 6: if we traded this cycle and all trades resolved, redeem & exit ──
+        if trade_count > 0 and not pending_trades:
+            log.info("All trades resolved — running final blocking redeem sweep...")
+            if LIVE_TRADING:
+                try:
+                    time.sleep(5)
+                    n = sweep_unredeemed_positions()
+                    if n:
+                        log.info("Final redeem sweep: claimed %d position(s)", n)
+                    else:
+                        log.info("Final redeem sweep: nothing to redeem (may already be redeemed)")
+                except Exception as e:
+                    log.warning("Final redeem sweep failed: %s", e)
+                _refresh_wallet()
+            break
+
         sleep_time = _calculate_sleep(rounds, pending_trades)
         log.debug("Sleeping %.1fs until next check", sleep_time)
         _sleep(sleep_time)
@@ -479,6 +485,16 @@ def main_loop():
             if not pending_trades:
                 break
             _sleep(2)
+        if not pending_trades and LIVE_TRADING:
+            log.info("Late resolution complete — running final blocking redeem sweep...")
+            try:
+                time.sleep(5)
+                n = sweep_unredeemed_positions()
+                if n:
+                    log.info("Final redeem sweep: claimed %d position(s)", n)
+            except Exception as e:
+                log.warning("Final redeem sweep failed: %s", e)
+            _refresh_wallet()
 
     ws.stop()
     dashboard.update_bot_status(False, cycle, trade_count, 0, mode)
@@ -615,14 +631,6 @@ def _record_resolution(trade: PendingTrade, won: bool, outcome: str):
 
     if won:
         record_bet_result(True, trade.bet_dollars, payout)
-        try:
-            tx = redeem_winning_position(trade.condition_id, neg_risk=trade.neg_risk)
-            if tx:
-                log.info("Redeem tx broadcast for %s: %s (confirming in background)", trade.condition_id[:12], tx)
-            else:
-                log.warning("Redeem broadcast returned None for %s", trade.condition_id[:12])
-        except Exception as e:
-            log.warning("Auto-redeem failed for %s: %s", trade.condition_id[:12], e)
     else:
         record_bet_result(False, trade.bet_dollars)
 

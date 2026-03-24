@@ -16,7 +16,10 @@ import threading
 import time
 from typing import Callable, Optional
 
+import requests
+
 from web3 import Web3
+from web3.middleware import ExtraDataToPOAMiddleware
 from eth_account import Account
 
 from src.config import (
@@ -110,6 +113,7 @@ def _get_web3():
         for rpc in _REDEEMER_RPCS:
             try:
                 w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
+                w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
                 w3.eth.block_number
                 _w3 = w3
                 break
@@ -339,3 +343,97 @@ def fetch_wallet_balances(address: str | None = None) -> dict:
     except Exception as e:
         log.warning("Failed to fetch wallet balances for %s: %s", addr[:10], e)
         return {"address": addr, "usdc": 0.0, "pol": 0.0}
+
+
+GAMMA_POSITIONS_URL = "https://gamma-api.polymarket.com/positions"
+DATA_API_POSITIONS_URL = "https://data-api.polymarket.com/positions"
+
+
+def _fetch_open_positions(wallet_lower: str) -> list:
+    positions = []
+    try:
+        resp = requests.get(
+            GAMMA_POSITIONS_URL,
+            params={"user": wallet_lower},
+            timeout=15,
+        )
+        if resp.ok:
+            positions = resp.json()
+            if isinstance(positions, list) and positions:
+                return positions
+    except Exception as e:
+        log.debug("Gamma positions fetch: %s", e)
+
+    try:
+        resp = requests.get(
+            DATA_API_POSITIONS_URL,
+            params={"user": wallet_lower},
+            timeout=15,
+        )
+        if resp.ok:
+            data = resp.json()
+            if isinstance(data, list):
+                return data
+    except Exception as e:
+        log.debug("Data API positions fetch: %s", e)
+
+    return []
+
+
+def sweep_unredeemed_positions() -> int:
+    """
+    Query Polymarket APIs for open positions and redeem each unique condition.
+    Safe to call on a timer: no-ops when nothing is redeemable or tx reverts.
+    Returns the number of successful on-chain redemptions.
+    """
+    if not PRIVATE_KEY:
+        return 0
+
+    try:
+        _, acct = _get_web3()
+        addr = acct.address.lower()
+    except Exception as e:
+        log.warning("Redeem sweep: cannot connect web3: %s", e)
+        return 0
+
+    positions = _fetch_open_positions(addr)
+    if not positions:
+        log.debug("Redeem sweep: no positions from API")
+        return 0
+
+    checked: set[str] = set()
+    redeemed = 0
+
+    for pos in positions:
+        cid = pos.get("conditionId", pos.get("condition_id", ""))
+        if not cid or cid in checked:
+            continue
+
+        size = float(pos.get("size", pos.get("amount", 0)) or 0)
+        if size <= 0:
+            continue
+
+        checked.add(cid)
+        neg_risk = bool(pos.get("negRisk", pos.get("neg_risk", False)))
+        outcome = pos.get("outcome", pos.get("title", "?"))
+
+        log.info(
+            "Redeem sweep: trying %s | %s | cid=%s...",
+            outcome, f"{size:.2f} shares", cid[:16],
+        )
+        try:
+            txh = redeem_winning_position_blocking(cid, neg_risk=neg_risk)
+            if txh:
+                redeemed += 1
+            time.sleep(2)
+        except Exception as e:
+            err = str(e).lower()
+            if "revert" in err or "execution reverted" in err:
+                log.debug("Redeem sweep: not redeemable for %s", cid[:16])
+            else:
+                log.warning("Redeem sweep failed for %s: %s", cid[:16], e)
+            time.sleep(1)
+
+    if redeemed:
+        log.info("Redeem sweep finished: %d successful redemption(s)", redeemed)
+    return redeemed
