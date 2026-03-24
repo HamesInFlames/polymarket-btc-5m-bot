@@ -74,7 +74,9 @@ def check_geoblock(timeout: int = 10) -> dict:
     result["clob_allowed"] = not clob_blocked
     result["raw"]["clob_blocked"] = clob_blocked
 
-    result["allowed"] = result["website_allowed"] and result["clob_allowed"]
+    # The bot only needs the CLOB to be unblocked — the website geoblock
+    # is for the polymarket.com frontend which the bot doesn't use.
+    result["allowed"] = result["clob_allowed"]
     return result
 
 
@@ -151,51 +153,35 @@ def assert_not_geoblocked() -> dict:
     result = check_geoblock()
 
     if result["allowed"]:
+        website_status = "OK" if result["website_allowed"] else "BLOCKED (irrelevant for bot)"
         log.info(
             "Geoblock check PASSED — IP: %s | Region: %s | Website: %s | CLOB: %s",
-            result["ip"], result["region"],
-            "OK" if result["website_allowed"] else "BLOCKED",
+            result["ip"], result["region"], website_status,
             "OK" if result["clob_allowed"] else "BLOCKED",
         )
+        if not result["website_allowed"]:
+            log.info(
+                "Website geoblock shows BLOCKED but this only affects polymarket.com "
+                "frontend — the bot uses CLOB/Gamma APIs which are separate."
+            )
         return result
 
-    # Determine which system is blocking
-    if not result["clob_allowed"] and result["website_allowed"]:
-        detail = (
-            "  The Polymarket WEBSITE allows your IP, but the CLOB TRADING\n"
-            "  API blocks it. The CLOB has STRICTER geoblocking — it may\n"
-            "  block entire countries (like all of Canada) even though the\n"
-            "  website only blocks specific provinces (like Ontario).\n"
-        )
-    elif not result["website_allowed"]:
-        detail = (
-            "  Both the Polymarket website and CLOB trading API block your IP.\n"
-        )
-    else:
-        detail = ""
-
     msg = (
-        f"GEOBLOCKED by Polymarket!\n"
+        f"GEOBLOCKED by Polymarket CLOB!\n"
         f"  Detected IP:     {result['ip']}\n"
         f"  Detected region: {result['region']}\n"
         f"  Website:         {'ALLOWED' if result['website_allowed'] else 'BLOCKED'}\n"
         f"  CLOB trading:    {'ALLOWED' if result['clob_allowed'] else 'BLOCKED'}\n"
         f"\n"
-        f"{detail}"
+        f"  The CLOB trading API blocks order placement from this IP.\n"
+        f"  NOTE: The CLOB geoblock can only be fully detected when placing\n"
+        f"  an actual order — if the probe above shows OK but orders fail\n"
+        f"  with 403, the CLOB is blocking your region.\n"
         f"\n"
-        f"  To fix: connect your VPN to a non-restricted country.\n"
-        f"  Countries known to work: Portugal, Germany, Poland, Singapore,\n"
-        f"  Switzerland, Japan, South Korea, Netherlands, etc.\n"
+        f"  To fix: connect VPN to a non-restricted country.\n"
+        f"  Try: Portugal, Poland, Singapore, Japan, South Korea, Brazil.\n"
         f"\n"
-        f"  Countries known to be BLOCKED:\n"
-        f"    - Canada (entire country on CLOB, Ontario on website)\n"
-        f"    - United States (some/all)\n"
-        f"    - United Kingdom\n"
-        f"    - Australia\n"
-        f"    - France\n"
-        f"\n"
-        f"  NordVPN: open app -> server list -> pick a country like\n"
-        f"  'Portugal', 'Germany', 'Poland', or 'Singapore'.\n"
+        f"  Known BLOCKED: Canada, US, UK, Australia, France, Germany (website).\n"
         f"\n"
         f"  Raw: {result['raw']}"
     )
