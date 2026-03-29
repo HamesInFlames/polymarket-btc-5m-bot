@@ -1,12 +1,49 @@
 """
 Shared bot state — thread-safe store that the trading loop writes to
 and the web dashboard reads from.
+
+Trade history and equity snapshots are persisted to data/ so they
+survive restarts and the dashboard always shows the full picture.
 """
 
+import json
 import logging
+import os
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
+
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_TRADES_FILE = _DATA_DIR / "trade_history.json"
+_EQUITY_FILE = _DATA_DIR / "equity_history.json"
+
+_MAX_TRADES = 1000
+_MAX_EQUITY = 2000
+_EQUITY_MIN_INTERVAL = 15  # seconds between equity snapshots (unless balance changes)
+
+
+def _ensure_data_dir():
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _load_json(path: Path, default):
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return default
+
+
+def _save_json(path: Path, data):
+    try:
+        _ensure_data_dir()
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        pass
 
 
 @dataclass
@@ -25,6 +62,28 @@ class TradeEntry:
     reason: str
     status: str = "resolved"  # "pending", "resolved", "failed"
 
+    def to_dict(self) -> dict:
+        return {
+            "timestamp": self.timestamp,
+            "direction": self.direction,
+            "action": self.action,
+            "price": self.price,
+            "size": self.size,
+            "edge": self.edge,
+            "confidence": self.confidence,
+            "pnl": self.pnl,
+            "won": self.won,
+            "btc_price": self.btc_price,
+            "condition_id": self.condition_id,
+            "reason": self.reason,
+            "status": self.status,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TradeEntry":
+        fields = cls.__dataclass_fields__
+        return cls(**{k: v for k, v in d.items() if k in fields})
+
 
 class BotState:
     _lock = threading.Lock()
@@ -42,8 +101,6 @@ class BotState:
         self.btc_updated_at: float = 0.0
 
         self.active_rounds: list[dict] = []
-
-        self.trades: list[TradeEntry] = []
 
         self.total_pnl: float = 0.0
         self.daily_pnl: float = 0.0
@@ -70,7 +127,31 @@ class BotState:
         self.bankroll_num_wins: int = 0
         self.bankroll_total_wagered: float = 0.0
         self.bankroll_max_drawdown: float = 0.0
+
+        # Persistent data — loaded from disk
+        self.trades: list[TradeEntry] = []
         self.equity_history: list[dict] = []
+        self._load_persistent_data()
+
+    # ── Persistence ──────────────────────────────────
+
+    def _load_persistent_data(self):
+        raw_trades = _load_json(_TRADES_FILE, [])
+        for d in raw_trades[-_MAX_TRADES:]:
+            try:
+                self.trades.append(TradeEntry.from_dict(d))
+            except Exception:
+                pass
+
+        self.equity_history = _load_json(_EQUITY_FILE, [])[-_MAX_EQUITY:]
+
+    def _save_trades(self):
+        _save_json(_TRADES_FILE, [t.to_dict() for t in self.trades[-_MAX_TRADES:]])
+
+    def _save_equity(self):
+        _save_json(_EQUITY_FILE, self.equity_history[-_MAX_EQUITY:])
+
+    # ── Public API ───────────────────────────────────
 
     def update_bot_status(self, running: bool, cycle: int, trade_count: int,
                           max_trades: int, mode: str):
@@ -113,8 +194,9 @@ class BotState:
     def add_trade(self, entry: TradeEntry):
         with self._lock:
             self.trades.append(entry)
-            if len(self.trades) > 500:
-                self.trades = self.trades[-500:]
+            if len(self.trades) > _MAX_TRADES:
+                self.trades = self.trades[-_MAX_TRADES:]
+            self._save_trades()
 
     def resolve_trade(self, condition_id: str, won: bool, pnl: float):
         """Update a pending trade to resolved state once the round settles."""
@@ -124,6 +206,7 @@ class BotState:
                     t.won = won
                     t.pnl = pnl
                     t.status = "resolved"
+                    self._save_trades()
                     return
 
     def update_risk_stats(self, stats: dict):
@@ -146,12 +229,7 @@ class BotState:
             self.wallet_updated_at = time.time()
             if bankroll is not None:
                 self.bankroll = bankroll
-                now = time.time()
-                last = self.equity_history[-1] if self.equity_history else None
-                if not last or abs(last["balance"] - bankroll) > 0.001 or now - last["ts"] > 30:
-                    self.equity_history.append({"ts": now, "balance": bankroll})
-                    if len(self.equity_history) > 500:
-                        self.equity_history = self.equity_history[-500:]
+                self._record_equity(bankroll)
 
     def update_bankroll_meta(self, starting: float, peak: float,
                              num_bets: int, num_wins: int,
@@ -210,24 +288,7 @@ class BotState:
                     "paused": self.paused,
                     "pause_reason": self.pause_reason,
                 },
-                "trades": [
-                    {
-                        "timestamp": t.timestamp,
-                        "direction": t.direction,
-                        "action": t.action,
-                        "price": t.price,
-                        "size": t.size,
-                        "edge": t.edge,
-                        "confidence": t.confidence,
-                        "pnl": t.pnl,
-                        "won": t.won,
-                        "btc_price": t.btc_price,
-                        "condition_id": t.condition_id,
-                        "reason": t.reason,
-                        "status": t.status,
-                    }
-                    for t in self.trades[-50:]
-                ],
+                "trades": [t.to_dict() for t in self.trades[-100:]],
                 "logs": self.log_lines[-80:],
                 "wallet": {
                     "address": self.wallet_address,
@@ -245,12 +306,27 @@ class BotState:
                     "total_wagered": self.bankroll_total_wagered,
                     "max_drawdown": self.bankroll_max_drawdown,
                 },
-                "equity_history": list(self.equity_history[-200:]),
+                "equity_history": list(self.equity_history[-500:]),
                 "error": {
                     "message": self.last_error,
                     "at": self.last_error_at,
                 },
             }
+
+    # ── Internal ─────────────────────────────────────
+
+    def _record_equity(self, balance: float):
+        """Append a bankroll snapshot and save to disk."""
+        now = time.time()
+        last = self.equity_history[-1] if self.equity_history else None
+        balance_changed = not last or abs(last["balance"] - balance) > 0.001
+        time_elapsed = not last or (now - last["ts"]) >= _EQUITY_MIN_INTERVAL
+
+        if balance_changed or time_elapsed:
+            self.equity_history.append({"ts": now, "balance": round(balance, 6)})
+            if len(self.equity_history) > _MAX_EQUITY:
+                self.equity_history = self.equity_history[-_MAX_EQUITY:]
+            self._save_equity()
 
 
 state = BotState()

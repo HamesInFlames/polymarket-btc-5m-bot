@@ -51,6 +51,10 @@ MIN_CONTRACT_PRICE: float = _float("MIN_CONTRACT_PRICE", 0.50)
 MAX_CONTRACT_PRICE: float = _float("MAX_CONTRACT_PRICE", 0.95)
 MAX_TRADE_SIZE: float = _float("MAX_TRADE_SIZE", 10.0)
 LIVE_TRADING: bool = _bool("LIVE_TRADING", False)
+# Paper mode: walk real CLOB ask depth for fill size/VWAP (FAK/FOK). If false, assume full fill at limit.
+REALISTIC_PAPER_FILLS: bool = _bool("REALISTIC_PAPER_FILLS", True)
+# Paper mode: cap spendable USDC by min(sim bankroll, on-chain wallet) when true (live-like capital).
+PAPER_CAP_WITH_WALLET: bool = _bool("PAPER_CAP_WITH_WALLET", False)
 
 # ── Risk controls ─────────────────────────────────────────────
 MAX_DAILY_LOSS: float = _float("MAX_DAILY_LOSS", 20.0)

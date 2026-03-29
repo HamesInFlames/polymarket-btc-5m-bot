@@ -17,6 +17,7 @@ Source: https://docs.polymarket.com/trading/orderbook
 """
 
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -346,6 +347,72 @@ def _fetch_order_book(token_id: str) -> Optional[dict]:
     except Exception as e:
         log.warning("Order book fetch failed for %s: %s", token_id[:16], e)
         return None
+
+
+def simulate_taker_buy_fill(
+    token_id: str,
+    limit_price: float,
+    target_contracts: float,
+    order_type: str = "FAK",
+) -> tuple[float, float, bool]:
+    """
+    Simulate an immediate taker BUY against the current REST order book.
+
+    Walks asks from best (lowest) price up to ``limit_price``, consuming
+    size like FAK (partial OK) or FOK (all target size or zero).
+
+    Returns:
+        (filled_contracts, volume_weighted_avg_price, book_was_available)
+        If the book cannot be fetched, returns (0.0, 0.0, False).
+
+    Notes:
+        Still an estimate: real matching can differ (latency, hidden flow,
+        concurrent trades, tick rounding). Closer than assuming a full fill
+        at the limit when liquidity is thin.
+    """
+    book = _fetch_order_book(token_id)
+    if not book:
+        return 0.0, 0.0, False
+
+    levels: list[tuple[float, float]] = []
+    for a in book.get("asks") or []:
+        try:
+            p = float(a["price"])
+            s = float(a["size"])
+            if s > 0 and 0 < p <= 1.0:
+                levels.append((p, s))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    levels.sort(key=lambda x: x[0])
+
+    remaining = float(target_contracts)
+    total_cost = 0.0
+    filled_raw = 0.0
+
+    for p, sz in levels:
+        if p > limit_price + 1e-12:
+            break
+        take = min(remaining, sz)
+        if take <= 0:
+            continue
+        total_cost += p * take
+        filled_raw += take
+        remaining -= take
+        if remaining <= 1e-12:
+            break
+
+    filled = math.floor(filled_raw)
+    if filled > 0 and filled_raw > 0:
+        total_cost *= filled / filled_raw
+
+    ot = (order_type or "FAK").upper()
+    tgt = math.floor(float(target_contracts))
+    if ot == "FOK" and tgt > 0 and filled < tgt:
+        return 0.0, 0.0, True
+
+    avg = (total_cost / filled) if filled > 0 else 0.0
+    return float(filled), avg, True
 
 
 def _fetch_midpoint(token_id: str) -> Optional[float]:

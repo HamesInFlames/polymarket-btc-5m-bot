@@ -26,8 +26,18 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
 from py_clob_client.order_builder.constants import BUY, SELL
 
-from src.config import CLOB_HOST, CHAIN_ID, PRIVATE_KEY, LIVE_TRADING, RELAYER_API_KEY, USDC_ADDRESS
+from src.config import (
+    CLOB_HOST,
+    CHAIN_ID,
+    PRIVATE_KEY,
+    LIVE_TRADING,
+    RELAYER_API_KEY,
+    USDC_ADDRESS,
+    REALISTIC_PAPER_FILLS,
+    PAPER_CAP_WITH_WALLET,
+)
 from src.geoblock import signal_clob_geoblock
+from src.market_reader import simulate_taker_buy_fill
 
 log = logging.getLogger(__name__)
 
@@ -158,9 +168,9 @@ def place_buy_order(
     For time-sensitive BTC 5-min rounds, FAK (Fill-And-Kill) is the default:
     fills whatever liquidity is available, cancels the rest.
 
-    In dry-run mode (LIVE_TRADING=false), returns a FillResult that assumes
-    the order would have filled at the limit price. The actual outcome is
-    determined later by checking the real market resolution.
+    In dry-run mode (LIVE_TRADING=false), simulates a taker fill against the
+    live CLOB book when REALISTIC_PAPER_FILLS=true (FAK/FOK walk of asks);
+    otherwise assumes a full fill at the limit. Market resolution is still real.
     """
     price = round(price, 2)
     size = math.floor(size)
@@ -170,10 +180,19 @@ def place_buy_order(
         size = math.ceil(min_order_size)
 
     usdc_needed = round(price * size, 2)
-    available = _check_usdc_balance()
+    if LIVE_TRADING:
+        available = _check_usdc_balance()
+    else:
+        from src.strategy import get_bankroll
+
+        br = max(0.0, get_bankroll().current_balance)
+        if PAPER_CAP_WITH_WALLET:
+            available = min(br, _check_usdc_balance())
+        else:
+            available = br
     if available < usdc_needed:
         log.warning(
-            "Insufficient USDC.e: need $%.2f but wallet has $%.2f — reducing order",
+            "Insufficient spendable balance: need $%.2f but have $%.2f — reducing order",
             usdc_needed, available,
         )
         if available < 1.0:
@@ -196,6 +215,48 @@ def place_buy_order(
             "type=%s tick=%s neg_risk=%s",
             token_id[:16], price, size, order_type, tick_size, neg_risk,
         )
+        if REALISTIC_PAPER_FILLS:
+            filled, vwap, book_ok = simulate_taker_buy_fill(
+                token_id, price, float(size), order_type,
+            )
+            if book_ok:
+                if filled > 0:
+                    log.info(
+                        "[PAPER] Book sim: filled %.1f / %.1f @ VWAP $%.4f (limit $%.3f, %s)",
+                        filled, size, vwap, price, order_type,
+                    )
+                    return FillResult(
+                        success=True,
+                        order_id="paper-book",
+                        status="SIMULATED_BOOK",
+                        requested_size=size,
+                        filled_size=filled,
+                        avg_price=vwap,
+                        is_live=False,
+                        raw_response={
+                            "mode": "book_sim",
+                            "limit": price,
+                            "order_type": order_type,
+                        },
+                    )
+                log.warning(
+                    "[PAPER] Book sim: no fill at/below limit $%.3f (%s) — "
+                    "thin book or FOK not fully covered",
+                    price, order_type,
+                )
+                return FillResult(
+                    success=False,
+                    order_id="",
+                    status="NO_LIQUIDITY",
+                    requested_size=size,
+                    filled_size=0.0,
+                    avg_price=0.0,
+                    is_live=False,
+                    raw_response={"mode": "book_sim", "order_type": order_type},
+                )
+            log.warning(
+                "[PAPER] Book unavailable — optimistic full fill at limit (not realistic)",
+            )
         return FillResult(
             success=True,
             order_id="dry-run",
@@ -271,10 +332,14 @@ def _parse_fill_result(
     """
     Parse the CLOB response into a structured FillResult.
 
-    Polymarket CLOB statuses:
-      MATCHED  – fully or partially matched immediately
-      LIVE     – resting on the book (should not happen with FAK)
-      DELAYED  – pending processing
+    Polymarket CLOB statuses (case-insensitive):
+      matched  – fully or partially matched immediately
+      live     – resting on the book (should not happen with FAK)
+      delayed  – pending processing
+
+    IMPORTANT: The CLOB may return size_matched=0 even when the order
+    was actually filled. When status is "matched", we treat the order
+    as filled at requested_size and verify via balance check.
     """
     if not resp:
         return FillResult(
@@ -284,26 +349,42 @@ def _parse_fill_result(
         )
 
     order_id = resp.get("orderID", resp.get("id", "?"))
-    status = resp.get("status", "UNKNOWN")
+    raw_status = resp.get("status", "UNKNOWN")
+    status = raw_status.upper()
 
     filled_size = 0.0
     avg_price = limit_price
 
+    size_matched_raw = resp.get("size_matched", None)
+
     if status == "MATCHED":
-        filled_size = float(resp.get("size_matched", requested_size))
+        if size_matched_raw is not None and float(size_matched_raw) > 0:
+            filled_size = float(size_matched_raw)
+        else:
+            # CLOB reported "matched" but size_matched is 0 or missing.
+            # This is a known CLOB quirk — the order WAS filled. Assume
+            # full fill and let balance reconciliation correct later.
+            filled_size = requested_size
+            log.warning(
+                "CLOB returned status=matched but size_matched=%s — "
+                "assuming full fill of %.1f contracts. Will verify via balance.",
+                size_matched_raw, requested_size,
+            )
         avg_price = float(resp.get("price", limit_price))
+
     elif status == "LIVE":
-        filled_size = float(resp.get("size_matched", 0.0))
+        filled_size = float(size_matched_raw or 0.0)
         avg_price = float(resp.get("price", limit_price))
+
     else:
-        filled_size = float(resp.get("size_matched", 0.0))
+        filled_size = float(size_matched_raw or 0.0)
         avg_price = float(resp.get("price", limit_price))
 
     success = filled_size > 0
 
     log.info(
-        "ORDER RESULT: id=%s status=%s filled=%.1f/%.1f @ $%.3f",
-        order_id, status, filled_size, requested_size, avg_price,
+        "ORDER RESULT: id=%s status=%s(%s) filled=%.1f/%.1f @ $%.3f",
+        order_id, status, raw_status, filled_size, requested_size, avg_price,
     )
 
     return FillResult(

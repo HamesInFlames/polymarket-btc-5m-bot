@@ -380,6 +380,26 @@ def _fetch_open_positions(wallet_lower: str) -> list:
     return []
 
 
+def check_ctf_token_balance(token_id: str) -> float:
+    """
+    Check on-chain CTF token balance for a specific token ID.
+    Returns the balance in human-readable units (divided by 1e6).
+    """
+    if not PRIVATE_KEY:
+        return 0.0
+    try:
+        w3, acct = _get_web3()
+        ctf = w3.eth.contract(
+            address=Web3.to_checksum_address(CTF_ADDRESS),
+            abi=CTF_REDEEM_ABI,
+        )
+        raw = ctf.functions.balanceOf(acct.address, int(token_id)).call()
+        return raw / 1e6
+    except Exception as e:
+        log.debug("CTF balance check failed for token %s: %s", token_id[:16], e)
+        return 0.0
+
+
 def sweep_unredeemed_positions() -> int:
     """
     Query Polymarket APIs for open positions and redeem each unique condition.
@@ -410,8 +430,23 @@ def sweep_unredeemed_positions() -> int:
             continue
 
         size = float(pos.get("size", pos.get("amount", 0)) or 0)
+
+        # Also check on-chain token balance if API reports 0
         if size <= 0:
-            continue
+            asset = pos.get("asset", pos.get("token_id", ""))
+            if asset:
+                try:
+                    on_chain_bal = check_ctf_token_balance(asset)
+                    if on_chain_bal > 0:
+                        log.info(
+                            "API reports 0 but on-chain CTF balance is %.2f for %s",
+                            on_chain_bal, cid[:16],
+                        )
+                        size = on_chain_bal
+                except Exception:
+                    pass
+            if size <= 0:
+                continue
 
         checked.add(cid)
         neg_risk = bool(pos.get("negRisk", pos.get("neg_risk", False)))
@@ -429,11 +464,13 @@ def sweep_unredeemed_positions() -> int:
         except Exception as e:
             err = str(e).lower()
             if "revert" in err or "execution reverted" in err:
-                log.debug("Redeem sweep: not redeemable for %s", cid[:16])
+                log.debug("Redeem sweep: not redeemable for %s (reverted)", cid[:16])
             else:
                 log.warning("Redeem sweep failed for %s: %s", cid[:16], e)
             time.sleep(1)
 
     if redeemed:
         log.info("Redeem sweep finished: %d successful redemption(s)", redeemed)
+    else:
+        log.debug("Redeem sweep: nothing to redeem from %d positions", len(positions))
     return redeemed
