@@ -79,6 +79,26 @@ async def root():
         return HTMLResponse(content=f.read())
 
 
+@app.get("/analytics", response_class=HTMLResponse)
+async def analytics():
+    html_path = os.path.join(os.path.dirname(__file__), "templates", "analytics.html")
+    with open(html_path, "r", encoding="utf-8") as f:
+        return HTMLResponse(content=f.read())
+
+
+@app.get("/api/trades")
+async def api_trades():
+    """Return all trades (up to 1000) plus bankroll meta for analytics."""
+    snap = dashboard.snapshot()
+    with dashboard._lock:
+        all_trades = [t.to_dict() for t in dashboard.trades]
+    return JSONResponse(content={
+        "trades": all_trades,
+        "bankroll_meta": snap["bankroll_meta"],
+        "equity_history": snap["equity_history"],
+    })
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()

@@ -1,0 +1,865 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PolyBot — Trade Analytics</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:        #06080d;
+  --bg2:       #0b0f18;
+  --surface:   #0f1420;
+  --surface2:  #151c2c;
+  --surface3:  #1a2338;
+  --border:    #1a2236;
+  --border-hl: #283352;
+  --text:      #e8ecf4;
+  --text-dim:  #7a8bab;
+  --text-muted:#4a5a7a;
+  --green:     #00e676;
+  --green-dim: #00c853;
+  --green-glow:rgba(0,230,118,.12);
+  --green-bg:  rgba(0,230,118,.06);
+  --red:       #ff5252;
+  --red-dim:   #ff1744;
+  --red-glow:  rgba(255,82,82,.12);
+  --red-bg:    rgba(255,82,82,.06);
+  --blue:      #448aff;
+  --blue-dim:  #2979ff;
+  --blue-glow: rgba(68,138,255,.12);
+  --amber:     #ffab40;
+  --amber-glow:rgba(255,171,64,.1);
+  --purple:    #b388ff;
+  --cyan:      #18ffff;
+  --radius:    10px;
+  --radius-lg: 14px;
+}
+html{font-size:14px;-webkit-font-smoothing:antialiased}
+body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-serif;min-height:100vh;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
+  background:radial-gradient(ellipse 80% 50% at 20% 10%,rgba(68,138,255,.04),transparent),
+             radial-gradient(ellipse 60% 40% at 80% 90%,rgba(0,230,118,.03),transparent)}
+
+/* Header */
+.header{position:sticky;top:0;z-index:50;display:flex;align-items:center;justify-content:space-between;
+  padding:.85rem 1.5rem;background:rgba(15,20,32,.85);backdrop-filter:blur(16px) saturate(1.3);border-bottom:1px solid var(--border)}
+.header-left{display:flex;align-items:center;gap:.85rem}
+.logo{font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:1.15rem;letter-spacing:-.03em;
+  background:linear-gradient(135deg,var(--blue),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.logo-sub{font-size:.65rem;color:var(--text-muted);font-weight:500;letter-spacing:.03em;margin-left:.15rem}
+.nav-links{display:flex;gap:.5rem}
+.nav-links a{color:var(--text-dim);text-decoration:none;font-size:.78rem;font-weight:500;padding:.35rem .75rem;
+  border-radius:6px;transition:all .2s}
+.nav-links a:hover{color:var(--text);background:var(--surface2)}
+.nav-links a.active{color:var(--blue);background:var(--blue-glow)}
+.header-right{display:flex;align-items:center;gap:.75rem;font-size:.78rem;color:var(--text-dim)}
+
+/* Layout */
+.container{position:relative;z-index:1;max-width:1440px;margin:0 auto;padding:1.25rem 1.5rem 3rem}
+
+/* Section titles */
+.section-title{font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:.85rem;color:var(--text-dim);
+  text-transform:uppercase;letter-spacing:.06em;margin-bottom:.75rem;display:flex;align-items:center;gap:.5rem}
+.section-title::before{content:'';width:3px;height:14px;border-radius:2px;background:var(--blue)}
+
+/* Cards */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:1.15rem;position:relative;overflow:hidden}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(68,138,255,.15),transparent)}
+
+/* Stat grid */
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:.75rem;margin-bottom:1.25rem}
+.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:1rem;text-align:center;position:relative;overflow:hidden}
+.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(68,138,255,.12),transparent)}
+.stat-label{font-size:.65rem;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:.4rem}
+.stat-value{font-family:'JetBrains Mono',monospace;font-size:1.35rem;font-weight:700;color:var(--text)}
+.stat-sub{font-size:.7rem;color:var(--text-dim);margin-top:.25rem;font-family:'JetBrains Mono',monospace}
+.stat-green .stat-value{color:var(--green)}
+.stat-red .stat-value{color:var(--red)}
+.stat-blue .stat-value{color:var(--blue)}
+.stat-amber .stat-value{color:var(--amber)}
+
+/* Chart containers */
+.chart-row{display:grid;grid-template-columns:1fr 1fr;gap:.75rem;margin-bottom:1.25rem}
+.chart-row.full{grid-template-columns:1fr}
+.chart-box{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:1rem;position:relative;overflow:hidden}
+.chart-box::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(68,138,255,.12),transparent)}
+.chart-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:.75rem}
+.chart-title{font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:.82rem;color:var(--text)}
+.chart-subtitle{font-size:.68rem;color:var(--text-muted)}
+.canvas-wrap{position:relative;width:100%;height:220px}
+.canvas-wrap canvas{position:absolute;top:0;left:0;width:100%;height:100%}
+.canvas-wrap.tall{height:280px}
+
+/* Direction breakdown */
+.dir-grid{display:grid;grid-template-columns:1fr 1fr;gap:.75rem}
+.dir-card{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:.85rem;text-align:center}
+.dir-label{font-size:.7rem;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:.5rem}
+.dir-bar{height:6px;border-radius:3px;background:var(--surface3);margin:.5rem 0;overflow:hidden}
+.dir-fill{height:100%;border-radius:3px;transition:width .5s}
+.dir-stats{display:flex;justify-content:space-between;font-size:.7rem;font-family:'JetBrains Mono',monospace}
+
+/* Heatmap */
+.heatmap-grid{display:grid;grid-template-columns:repeat(24,1fr);gap:3px}
+.heat-cell{aspect-ratio:1;border-radius:3px;display:flex;align-items:center;justify-content:center;
+  font-size:.55rem;font-family:'JetBrains Mono',monospace;color:transparent;transition:all .3s;cursor:default}
+.heat-cell:hover{color:var(--text);transform:scale(1.3);z-index:2}
+.heat-labels{display:grid;grid-template-columns:repeat(24,1fr);gap:3px;margin-top:.25rem}
+.heat-labels span{text-align:center;font-size:.55rem;color:var(--text-muted);font-family:'JetBrains Mono',monospace}
+
+/* Streak */
+.streak-row{display:flex;gap:3px;flex-wrap:wrap;margin-top:.5rem}
+.streak-dot{width:14px;height:14px;border-radius:3px;transition:transform .2s}
+.streak-dot:hover{transform:scale(1.4)}
+.streak-dot.win{background:var(--green)}
+.streak-dot.loss{background:var(--red)}
+.streak-dot.pending{background:var(--surface3)}
+
+/* Trade table */
+.table-wrap{overflow-x:auto;margin-top:.75rem}
+table{width:100%;border-collapse:collapse;font-size:.75rem}
+th{font-size:.65rem;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.06em;
+  padding:.6rem .75rem;text-align:left;border-bottom:1px solid var(--border);cursor:pointer;white-space:nowrap;user-select:none}
+th:hover{color:var(--text)}
+th .sort-arrow{margin-left:.25rem;opacity:.4}
+th.sorted .sort-arrow{opacity:1;color:var(--blue)}
+td{padding:.55rem .75rem;border-bottom:1px solid rgba(26,34,54,.5);font-family:'JetBrains Mono',monospace;
+  white-space:nowrap;color:var(--text-dim)}
+tr:hover td{background:rgba(68,138,255,.03);color:var(--text)}
+.td-win{color:var(--green)!important}
+.td-loss{color:var(--red)!important}
+.td-pending{color:var(--amber)!important}
+.pill{display:inline-block;padding:.15rem .5rem;border-radius:9999px;font-size:.6rem;font-weight:600}
+.pill-up{background:var(--green-glow);color:var(--green)}
+.pill-down{background:var(--red-glow);color:var(--red)}
+.pill-win{background:var(--green-glow);color:var(--green)}
+.pill-loss{background:var(--red-glow);color:var(--red)}
+.pill-pending{background:var(--amber-glow);color:var(--amber)}
+
+/* Filter bar */
+.filter-bar{display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.75rem}
+.filter-btn{font-size:.68rem;font-weight:600;padding:.3rem .7rem;border-radius:6px;border:1px solid var(--border);
+  background:var(--surface2);color:var(--text-dim);cursor:pointer;transition:all .2s}
+.filter-btn:hover{border-color:var(--border-hl);color:var(--text)}
+.filter-btn.active{border-color:var(--blue);color:var(--blue);background:var(--blue-glow)}
+
+/* Empty state */
+.empty-state{text-align:center;padding:3rem 1rem;color:var(--text-muted)}
+.empty-state h2{font-family:'Space Grotesk',sans-serif;font-size:1.1rem;color:var(--text-dim);margin-bottom:.5rem}
+.empty-state p{font-size:.82rem}
+
+/* Responsive */
+@media(max-width:900px){.chart-row{grid-template-columns:1fr}.stat-grid{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:600px){.stat-grid{grid-template-columns:repeat(2,1fr)}.container{padding:1rem}}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <span class="logo">PolyBot<span class="logo-sub">ANALYTICS</span></span>
+    <div class="nav-links">
+      <a href="/">Dashboard</a>
+      <a href="/analytics" class="active">Analytics</a>
+    </div>
+  </div>
+  <div class="header-right">
+    <span id="trade-count">0 trades</span>
+    <span id="last-updated">--</span>
+  </div>
+</div>
+
+<div class="container">
+
+  <!-- Summary Stats -->
+  <div class="section-title">Performance Summary</div>
+  <div class="stat-grid" id="stats-grid">
+    <div class="stat-card" id="stat-pnl"><div class="stat-label">Total PnL</div><div class="stat-value">--</div><div class="stat-sub" id="stat-pnl-sub"></div></div>
+    <div class="stat-card" id="stat-winrate"><div class="stat-label">Win Rate</div><div class="stat-value">--</div><div class="stat-sub" id="stat-winrate-sub"></div></div>
+    <div class="stat-card" id="stat-roi"><div class="stat-label">ROI</div><div class="stat-value">--</div><div class="stat-sub" id="stat-roi-sub"></div></div>
+    <div class="stat-card" id="stat-sharpe"><div class="stat-label">Sharpe Ratio</div><div class="stat-value">--</div></div>
+    <div class="stat-card" id="stat-pf"><div class="stat-label">Profit Factor</div><div class="stat-value">--</div></div>
+    <div class="stat-card" id="stat-dd"><div class="stat-label">Max Drawdown</div><div class="stat-value">--</div></div>
+    <div class="stat-card" id="stat-avg-edge"><div class="stat-label">Avg Edge</div><div class="stat-value">--</div></div>
+    <div class="stat-card" id="stat-expectancy"><div class="stat-label">Expectancy</div><div class="stat-value">--</div><div class="stat-sub" id="stat-exp-sub"></div></div>
+  </div>
+
+  <!-- PnL Chart -->
+  <div class="chart-row full">
+    <div class="chart-box">
+      <div class="chart-header">
+        <span class="chart-title">Cumulative PnL</span>
+        <span class="chart-subtitle" id="pnl-subtitle"></span>
+      </div>
+      <div class="canvas-wrap tall"><canvas id="pnl-chart"></canvas></div>
+    </div>
+  </div>
+
+  <!-- Win Rate + Edge Charts -->
+  <div class="chart-row">
+    <div class="chart-box">
+      <div class="chart-header">
+        <span class="chart-title">Rolling Win Rate</span>
+        <span class="chart-subtitle">10-trade &amp; 20-trade windows</span>
+      </div>
+      <div class="canvas-wrap"><canvas id="winrate-chart"></canvas></div>
+    </div>
+    <div class="chart-box">
+      <div class="chart-header">
+        <span class="chart-title">Edge vs Outcome</span>
+        <span class="chart-subtitle">Predicted edge vs actual PnL</span>
+      </div>
+      <div class="canvas-wrap"><canvas id="edge-chart"></canvas></div>
+    </div>
+  </div>
+
+  <!-- Direction + Hourly -->
+  <div class="chart-row">
+    <div class="chart-box">
+      <div class="chart-header"><span class="chart-title">Direction Breakdown</span></div>
+      <div class="dir-grid">
+        <div class="dir-card" id="dir-up">
+          <div class="dir-label">UP Trades</div>
+          <div class="dir-stats"><span id="up-count">0</span><span id="up-winrate">0%</span></div>
+          <div class="dir-bar"><div class="dir-fill" id="up-bar" style="width:0;background:var(--green)"></div></div>
+          <div class="dir-stats"><span id="up-pnl" style="color:var(--text-dim)">$0.00</span><span id="up-avg" style="color:var(--text-dim)">avg $0.00</span></div>
+        </div>
+        <div class="dir-card" id="dir-down">
+          <div class="dir-label">DOWN Trades</div>
+          <div class="dir-stats"><span id="dn-count">0</span><span id="dn-winrate">0%</span></div>
+          <div class="dir-bar"><div class="dir-fill" id="dn-bar" style="width:0;background:var(--red)"></div></div>
+          <div class="dir-stats"><span id="dn-pnl" style="color:var(--text-dim)">$0.00</span><span id="dn-avg" style="color:var(--text-dim)">avg $0.00</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="chart-box">
+      <div class="chart-header">
+        <span class="chart-title">Hourly Performance</span>
+        <span class="chart-subtitle">PnL by hour (UTC)</span>
+      </div>
+      <div style="margin-top:.5rem">
+        <div class="heatmap-grid" id="heatmap"></div>
+        <div class="heat-labels" id="heat-labels"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Streaks + PnL Distribution -->
+  <div class="chart-row">
+    <div class="chart-box">
+      <div class="chart-header">
+        <span class="chart-title">Win/Loss Streaks</span>
+        <span class="chart-subtitle" id="streak-info"></span>
+      </div>
+      <div class="streak-row" id="streak-dots"></div>
+    </div>
+    <div class="chart-box">
+      <div class="chart-header">
+        <span class="chart-title">PnL Distribution</span>
+        <span class="chart-subtitle">Histogram of trade outcomes</span>
+      </div>
+      <div class="canvas-wrap"><canvas id="dist-chart"></canvas></div>
+    </div>
+  </div>
+
+  <!-- Trade Table -->
+  <div class="section-title">Trade History</div>
+  <div class="card">
+    <div class="filter-bar">
+      <button class="filter-btn active" data-filter="all">All</button>
+      <button class="filter-btn" data-filter="wins">Wins</button>
+      <button class="filter-btn" data-filter="losses">Losses</button>
+      <button class="filter-btn" data-filter="up">UP</button>
+      <button class="filter-btn" data-filter="down">DOWN</button>
+      <button class="filter-btn" data-filter="pending">Pending</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th data-col="timestamp">Time <span class="sort-arrow">▼</span></th>
+            <th data-col="direction">Dir <span class="sort-arrow">▼</span></th>
+            <th data-col="price">Price <span class="sort-arrow">▼</span></th>
+            <th data-col="size">Size <span class="sort-arrow">▼</span></th>
+            <th data-col="edge">Edge <span class="sort-arrow">▼</span></th>
+            <th data-col="confidence">Conf <span class="sort-arrow">▼</span></th>
+            <th data-col="btc_price">BTC <span class="sort-arrow">▼</span></th>
+            <th data-col="pnl">PnL <span class="sort-arrow">▼</span></th>
+            <th data-col="won">Result <span class="sort-arrow">▼</span></th>
+          </tr>
+        </thead>
+        <tbody id="trade-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="empty-state" id="empty-state" style="display:none">
+    <h2>No trades yet</h2>
+    <p>Start the bot and wait for trades to appear here. Analytics will populate automatically.</p>
+  </div>
+</div>
+
+<script>
+/* ── Helpers ──────────────────────────────────── */
+const $ = id => document.getElementById(id);
+const fmt$ = (v, d=2) => (v < 0 ? '-$' + Math.abs(v).toFixed(d) : '$' + v.toFixed(d));
+const fmtPct = (v, d=1) => (v * 100).toFixed(d) + '%';
+
+function fmtTime(ts) {
+  const d = new Date(ts * 1000);
+  return d.toLocaleString('en-US', {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
+}
+
+/* ── State ────────────────────────────────────── */
+let allTrades = [];
+let sortCol = 'timestamp', sortAsc = false;
+let activeFilter = 'all';
+
+/* ── Fetch data ───────────────────────────────── */
+async function fetchData() {
+  try {
+    const r = await fetch('/api/trades');
+    if (!r.ok) throw new Error('API error');
+    const data = await r.json();
+    allTrades = data.trades || [];
+    render(data);
+  } catch(e) {
+    // fallback to /api/state
+    try {
+      const r2 = await fetch('/api/state');
+      if (!r2.ok) return;
+      const data = await r2.json();
+      allTrades = data.trades || [];
+      render({trades: allTrades, bankroll_meta: data.bankroll_meta, equity_history: data.equity_history});
+    } catch(e2) { console.warn('Fetch failed', e2); }
+  }
+}
+
+function render(data) {
+  const trades = data.trades || [];
+  const bm = data.bankroll_meta || {};
+  const resolved = trades.filter(t => t.status === 'resolved');
+
+  $('trade-count').textContent = trades.length + ' trades (' + resolved.length + ' resolved)';
+  $('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+
+  if (trades.length === 0) {
+    $('empty-state').style.display = '';
+    return;
+  }
+  $('empty-state').style.display = 'none';
+
+  renderStats(resolved, bm);
+  renderPnlChart(resolved);
+  renderWinRateChart(resolved);
+  renderEdgeChart(resolved);
+  renderDirections(resolved);
+  renderHeatmap(resolved);
+  renderStreaks(trades);
+  renderDistChart(resolved);
+  renderTable();
+}
+
+/* ── Stats ────────────────────────────────────── */
+function renderStats(trades, bm) {
+  if (!trades.length) return;
+
+  const wins = trades.filter(t => t.won);
+  const losses = trades.filter(t => !t.won);
+  const totalPnl = trades.reduce((s, t) => s + t.pnl, 0);
+  const winRate = trades.length ? wins.length / trades.length : 0;
+  const totalWagered = bm.total_wagered || trades.reduce((s, t) => s + (t.price * t.size), 0);
+  const roi = totalWagered > 0 ? totalPnl / totalWagered : 0;
+
+  // Sharpe
+  const pnls = trades.map(t => t.pnl);
+  const mean = pnls.reduce((a, b) => a + b, 0) / pnls.length;
+  const std = Math.sqrt(pnls.reduce((s, p) => s + (p - mean) ** 2, 0) / pnls.length) || 0.001;
+  const sharpe = mean / std;
+
+  // Profit factor
+  const grossWin = wins.reduce((s, t) => s + t.pnl, 0);
+  const grossLoss = Math.abs(losses.reduce((s, t) => s + t.pnl, 0)) || 0.001;
+  const pf = grossWin / grossLoss;
+
+  // Max drawdown
+  let peak = 0, maxDD = 0, cum = 0;
+  for (const t of trades) {
+    cum += t.pnl;
+    if (cum > peak) peak = cum;
+    const dd = (peak - cum) / (peak || 1);
+    if (dd > maxDD) maxDD = dd;
+  }
+  const ddFromBM = bm.max_drawdown || maxDD;
+
+  // Avg edge
+  const avgEdge = trades.reduce((s, t) => s + (t.edge || 0), 0) / trades.length;
+
+  // Expectancy
+  const expectancy = mean;
+
+  const pnlCard = $('stat-pnl');
+  pnlCard.querySelector('.stat-value').textContent = fmt$(totalPnl);
+  pnlCard.className = 'stat-card ' + (totalPnl >= 0 ? 'stat-green' : 'stat-red');
+  $('stat-pnl-sub').textContent = wins.length + 'W / ' + losses.length + 'L';
+
+  const wrCard = $('stat-winrate');
+  wrCard.querySelector('.stat-value').textContent = fmtPct(winRate);
+  wrCard.className = 'stat-card ' + (winRate >= 0.5 ? 'stat-green' : 'stat-red');
+  $('stat-winrate-sub').textContent = trades.length + ' trades';
+
+  const roiCard = $('stat-roi');
+  roiCard.querySelector('.stat-value').textContent = fmtPct(roi);
+  roiCard.className = 'stat-card ' + (roi >= 0 ? 'stat-green' : 'stat-red');
+  $('stat-roi-sub').textContent = 'on ' + fmt$(totalWagered) + ' wagered';
+
+  const sharpeCard = $('stat-sharpe');
+  sharpeCard.querySelector('.stat-value').textContent = sharpe.toFixed(2);
+  sharpeCard.className = 'stat-card ' + (sharpe >= 0 ? 'stat-blue' : 'stat-red');
+
+  const pfCard = $('stat-pf');
+  pfCard.querySelector('.stat-value').textContent = pf.toFixed(2) + 'x';
+  pfCard.className = 'stat-card ' + (pf >= 1 ? 'stat-green' : 'stat-red');
+
+  const ddCard = $('stat-dd');
+  ddCard.querySelector('.stat-value').textContent = fmtPct(ddFromBM);
+  ddCard.className = 'stat-card stat-amber';
+
+  $('stat-avg-edge').querySelector('.stat-value').textContent = fmtPct(avgEdge);
+  $('stat-avg-edge').className = 'stat-card ' + (avgEdge > 0 ? 'stat-green' : 'stat-red');
+
+  const expCard = $('stat-expectancy');
+  expCard.querySelector('.stat-value').textContent = fmt$(expectancy, 4);
+  expCard.className = 'stat-card ' + (expectancy >= 0 ? 'stat-green' : 'stat-red');
+  $('stat-exp-sub').textContent = 'per trade';
+}
+
+/* ── PnL Chart ────────────────────────────────── */
+function renderPnlChart(trades) {
+  const canvas = $('pnl-chart');
+  const rect = canvas.parentElement.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = rect.width * dpr; canvas.height = rect.height * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  const W = rect.width, H = rect.height;
+  ctx.clearRect(0, 0, W, H);
+
+  if (trades.length < 1) { drawEmpty(ctx, W, H); return; }
+
+  const points = [{y:0}];
+  let cum = 0;
+  for (const t of trades) { cum += t.pnl; points.push({y: cum, won: t.won}); }
+
+  $('pnl-subtitle').textContent = trades.length + ' trades | Final: ' + fmt$(cum);
+
+  const ys = points.map(p => p.y);
+  const minY = Math.min(0, ...ys), maxY = Math.max(0, ...ys);
+  const rangeY = (maxY - minY) || 1;
+  const pad = {t:20, b:20, l:56, r:24};
+  const cW = W - pad.l - pad.r, cH = H - pad.t - pad.b;
+  const toX = i => pad.l + (i / (points.length - 1)) * cW;
+  const toY = v => pad.t + cH - ((v - minY) / rangeY) * cH;
+
+  // Grid
+  ctx.strokeStyle = 'rgba(26,35,56,.6)'; ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) { const y = pad.t + (cH/4)*i; ctx.beginPath(); ctx.moveTo(pad.l,y); ctx.lineTo(W-pad.r,y); ctx.stroke(); }
+
+  // Zero line
+  ctx.strokeStyle = 'rgba(74,90,122,.5)'; ctx.setLineDash([5,3]);
+  ctx.beginPath(); ctx.moveTo(pad.l, toY(0)); ctx.lineTo(W-pad.r, toY(0)); ctx.stroke();
+  ctx.setLineDash([]);
+
+  const last = points[points.length-1].y;
+  const pos = last >= 0;
+  const lineColor = pos ? '#00e676' : '#ff5252';
+  const glowA = pos ? 'rgba(0,230,118,' : 'rgba(255,82,82,';
+
+  // Fill
+  const grad = ctx.createLinearGradient(0, pad.t, 0, H-pad.b);
+  grad.addColorStop(0, glowA + (pos ? '.14)' : '0)'));
+  grad.addColorStop(1, glowA + (pos ? '0)' : '.14)'));
+  ctx.beginPath(); ctx.moveTo(toX(0), toY(0));
+  for (let i=0;i<points.length;i++) ctx.lineTo(toX(i), toY(points[i].y));
+  ctx.lineTo(toX(points.length-1), toY(0)); ctx.closePath(); ctx.fillStyle = grad; ctx.fill();
+
+  // Line
+  ctx.beginPath();
+  for (let i=0;i<points.length;i++) i===0?ctx.moveTo(toX(i),toY(points[i].y)):ctx.lineTo(toX(i),toY(points[i].y));
+  ctx.strokeStyle = lineColor; ctx.lineWidth = 2.5; ctx.lineJoin='round'; ctx.lineCap='round'; ctx.stroke();
+
+  // Dots
+  for (let i=1;i<points.length;i++) {
+    ctx.beginPath(); ctx.arc(toX(i), toY(points[i].y), 3.5, 0, Math.PI*2);
+    ctx.fillStyle = points[i].won ? '#00e676' : '#ff5252'; ctx.fill();
+    ctx.beginPath(); ctx.arc(toX(i), toY(points[i].y), 1.5, 0, Math.PI*2);
+    ctx.fillStyle = '#06080d'; ctx.fill();
+  }
+
+  // Labels
+  ctx.fillStyle = '#4a5a7a'; ctx.font = '9px JetBrains Mono, monospace'; ctx.textAlign = 'right';
+  ctx.fillText('$0', pad.l-8, toY(0)+3);
+  if (maxY !== 0) ctx.fillText(fmt$(maxY), pad.l-8, pad.t+8);
+  if (minY !== 0) ctx.fillText(fmt$(minY), pad.l-8, H-pad.b-2);
+}
+
+/* ── Rolling Win Rate ─────────────────────────── */
+function renderWinRateChart(trades) {
+  const canvas = $('winrate-chart');
+  const rect = canvas.parentElement.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = rect.width * dpr; canvas.height = rect.height * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  const W = rect.width, H = rect.height;
+  ctx.clearRect(0, 0, W, H);
+
+  if (trades.length < 5) { drawEmpty(ctx, W, H, 'Need 5+ trades'); return; }
+
+  function rolling(arr, window) {
+    const out = [];
+    for (let i = window - 1; i < arr.length; i++) {
+      let w = 0;
+      for (let j = i - window + 1; j <= i; j++) if (arr[j].won) w++;
+      out.push(w / window);
+    }
+    return out;
+  }
+
+  const r10 = rolling(trades, Math.min(10, trades.length));
+  const r20 = trades.length >= 20 ? rolling(trades, 20) : [];
+  const maxLen = Math.max(r10.length, r20.length);
+
+  const pad = {t:20, b:20, l:46, r:20};
+  const cW = W-pad.l-pad.r, cH = H-pad.t-pad.b;
+  const toX = i => pad.l + (i / (maxLen - 1 || 1)) * cW;
+  const toY = v => pad.t + cH - v * cH;
+
+  // Grid
+  ctx.strokeStyle = 'rgba(26,35,56,.6)'; ctx.lineWidth = 1;
+  [0, 0.25, 0.5, 0.75, 1].forEach(v => {
+    const y = toY(v); ctx.beginPath(); ctx.moveTo(pad.l,y); ctx.lineTo(W-pad.r,y); ctx.stroke();
+  });
+
+  // 50% line
+  ctx.strokeStyle = 'rgba(255,171,64,.3)'; ctx.setLineDash([5,3]);
+  ctx.beginPath(); ctx.moveTo(pad.l, toY(0.5)); ctx.lineTo(W-pad.r, toY(0.5)); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // R10 line
+  ctx.beginPath();
+  for (let i=0;i<r10.length;i++) i===0?ctx.moveTo(toX(i),toY(r10[i])):ctx.lineTo(toX(i),toY(r10[i]));
+  ctx.strokeStyle = '#448aff'; ctx.lineWidth = 2; ctx.lineJoin='round'; ctx.stroke();
+
+  // R20 line
+  if (r20.length > 1) {
+    const offset = r10.length - r20.length;
+    ctx.beginPath();
+    for (let i=0;i<r20.length;i++) i===0?ctx.moveTo(toX(i+offset),toY(r20[i])):ctx.lineTo(toX(i+offset),toY(r20[i]));
+    ctx.strokeStyle = '#b388ff'; ctx.lineWidth = 2; ctx.stroke();
+  }
+
+  // Legend
+  ctx.font = '10px Inter, sans-serif';
+  ctx.fillStyle = '#448aff'; ctx.fillRect(W-pad.r-80, pad.t, 10, 3);
+  ctx.fillText('10-trade', W-pad.r-66, pad.t+5);
+  if (r20.length) {
+    ctx.fillStyle = '#b388ff'; ctx.fillRect(W-pad.r-80, pad.t+14, 10, 3);
+    ctx.fillText('20-trade', W-pad.r-66, pad.t+19);
+  }
+
+  // Y labels
+  ctx.fillStyle = '#4a5a7a'; ctx.font = '9px JetBrains Mono, monospace'; ctx.textAlign = 'right';
+  [0, 0.5, 1].forEach(v => ctx.fillText(fmtPct(v, 0), pad.l-6, toY(v)+3));
+}
+
+/* ── Edge vs Outcome ──────────────────────────── */
+function renderEdgeChart(trades) {
+  const canvas = $('edge-chart');
+  const rect = canvas.parentElement.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = rect.width * dpr; canvas.height = rect.height * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  const W = rect.width, H = rect.height;
+  ctx.clearRect(0, 0, W, H);
+
+  if (trades.length < 2) { drawEmpty(ctx, W, H); return; }
+
+  const edges = trades.map(t => t.edge || 0);
+  const pnls = trades.map(t => t.pnl);
+  const pad = {t:20, b:24, l:50, r:20};
+  const cW = W-pad.l-pad.r, cH = H-pad.t-pad.b;
+
+  const minE = Math.min(...edges), maxE = Math.max(...edges);
+  const minP = Math.min(...pnls), maxP = Math.max(...pnls);
+  const rE = (maxE - minE) || 0.01, rP = (maxP - minP) || 0.01;
+
+  const toX = e => pad.l + ((e - minE) / rE) * cW;
+  const toY = p => pad.t + cH - ((p - minP) / rP) * cH;
+
+  // Grid
+  ctx.strokeStyle = 'rgba(26,35,56,.6)'; ctx.lineWidth = 1;
+  for (let i=0;i<=4;i++) { const y=pad.t+(cH/4)*i; ctx.beginPath(); ctx.moveTo(pad.l,y); ctx.lineTo(W-pad.r,y); ctx.stroke(); }
+
+  // Zero PnL line
+  if (minP < 0 && maxP > 0) {
+    ctx.strokeStyle = 'rgba(74,90,122,.4)'; ctx.setLineDash([4,3]);
+    ctx.beginPath(); ctx.moveTo(pad.l, toY(0)); ctx.lineTo(W-pad.r, toY(0)); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Points
+  for (let i=0;i<trades.length;i++) {
+    ctx.beginPath(); ctx.arc(toX(edges[i]), toY(pnls[i]), 4, 0, Math.PI*2);
+    ctx.fillStyle = trades[i].won ? 'rgba(0,230,118,.6)' : 'rgba(255,82,82,.6)'; ctx.fill();
+  }
+
+  // Axis labels
+  ctx.fillStyle = '#4a5a7a'; ctx.font = '9px JetBrains Mono, monospace';
+  ctx.textAlign = 'center'; ctx.fillText('Edge %', W/2, H-4);
+  ctx.textAlign = 'right';
+  ctx.fillText(fmt$(maxP), pad.l-6, pad.t+8);
+  ctx.fillText(fmt$(minP), pad.l-6, H-pad.b-2);
+}
+
+/* ── Direction Breakdown ──────────────────────── */
+function renderDirections(trades) {
+  const up = trades.filter(t => t.direction === 'up');
+  const dn = trades.filter(t => t.direction === 'down');
+  const upWins = up.filter(t => t.won).length;
+  const dnWins = dn.filter(t => t.won).length;
+  const upPnl = up.reduce((s,t) => s+t.pnl, 0);
+  const dnPnl = dn.reduce((s,t) => s+t.pnl, 0);
+
+  $('up-count').textContent = up.length + ' trades';
+  $('up-winrate').textContent = up.length ? fmtPct(upWins/up.length) : '0%';
+  $('up-bar').style.width = up.length ? fmtPct(upWins/up.length) : '0%';
+  $('up-pnl').textContent = fmt$(upPnl);
+  $('up-pnl').style.color = upPnl >= 0 ? 'var(--green)' : 'var(--red)';
+  $('up-avg').textContent = 'avg ' + (up.length ? fmt$(upPnl/up.length, 4) : '$0.00');
+
+  $('dn-count').textContent = dn.length + ' trades';
+  $('dn-winrate').textContent = dn.length ? fmtPct(dnWins/dn.length) : '0%';
+  $('dn-bar').style.width = dn.length ? fmtPct(dnWins/dn.length) : '0%';
+  $('dn-pnl').textContent = fmt$(dnPnl);
+  $('dn-pnl').style.color = dnPnl >= 0 ? 'var(--green)' : 'var(--red)';
+  $('dn-avg').textContent = 'avg ' + (dn.length ? fmt$(dnPnl/dn.length, 4) : '$0.00');
+}
+
+/* ── Hourly Heatmap ───────────────────────────── */
+function renderHeatmap(trades) {
+  const hourly = new Array(24).fill(null).map(() => ({pnl:0, count:0}));
+  for (const t of trades) {
+    const h = new Date(t.timestamp * 1000).getUTCHours();
+    hourly[h].pnl += t.pnl;
+    hourly[h].count++;
+  }
+
+  const maxAbs = Math.max(...hourly.map(h => Math.abs(h.pnl)), 0.01);
+  const grid = $('heatmap');
+  const labels = $('heat-labels');
+  grid.innerHTML = ''; labels.innerHTML = '';
+
+  for (let h = 0; h < 24; h++) {
+    const cell = document.createElement('div');
+    cell.className = 'heat-cell';
+    const v = hourly[h].pnl;
+    const intensity = Math.min(Math.abs(v) / maxAbs, 1);
+    if (hourly[h].count === 0) {
+      cell.style.background = 'var(--surface3)';
+      cell.title = h + ':00 — no trades';
+    } else if (v >= 0) {
+      cell.style.background = `rgba(0,230,118,${0.1 + intensity * 0.5})`;
+      cell.title = h + ':00 — ' + fmt$(v) + ' (' + hourly[h].count + ' trades)';
+    } else {
+      cell.style.background = `rgba(255,82,82,${0.1 + intensity * 0.5})`;
+      cell.title = h + ':00 — ' + fmt$(v) + ' (' + hourly[h].count + ' trades)';
+    }
+    cell.textContent = hourly[h].count || '';
+    grid.appendChild(cell);
+
+    const lbl = document.createElement('span');
+    lbl.textContent = h.toString().padStart(2, '0');
+    labels.appendChild(lbl);
+  }
+}
+
+/* ── Streaks ──────────────────────────────────── */
+function renderStreaks(trades) {
+  const dots = $('streak-dots');
+  dots.innerHTML = '';
+
+  let maxWinStreak = 0, maxLossStreak = 0, curWin = 0, curLoss = 0;
+  for (const t of trades) {
+    const dot = document.createElement('div');
+    if (t.status === 'pending') {
+      dot.className = 'streak-dot pending';
+      dot.title = 'Pending';
+    } else if (t.won) {
+      dot.className = 'streak-dot win';
+      dot.title = 'WIN ' + fmt$(t.pnl);
+      curWin++; curLoss = 0;
+    } else {
+      dot.className = 'streak-dot loss';
+      dot.title = 'LOSS ' + fmt$(t.pnl);
+      curLoss++; curWin = 0;
+    }
+    if (curWin > maxWinStreak) maxWinStreak = curWin;
+    if (curLoss > maxLossStreak) maxLossStreak = curLoss;
+    dots.appendChild(dot);
+  }
+
+  $('streak-info').textContent = 'Best: ' + maxWinStreak + 'W | Worst: ' + maxLossStreak + 'L';
+}
+
+/* ── PnL Distribution ─────────────────────────── */
+function renderDistChart(trades) {
+  const canvas = $('dist-chart');
+  const rect = canvas.parentElement.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = rect.width * dpr; canvas.height = rect.height * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  const W = rect.width, H = rect.height;
+  ctx.clearRect(0, 0, W, H);
+
+  if (trades.length < 3) { drawEmpty(ctx, W, H, 'Need 3+ trades'); return; }
+
+  const pnls = trades.map(t => t.pnl).sort((a,b) => a - b);
+  const min = pnls[0], max = pnls[pnls.length-1];
+  const range = (max - min) || 0.01;
+  const numBins = Math.min(Math.max(Math.ceil(Math.sqrt(trades.length)), 5), 25);
+  const binWidth = range / numBins;
+  const bins = new Array(numBins).fill(0);
+  const binEdges = [];
+
+  for (let i = 0; i <= numBins; i++) binEdges.push(min + i * binWidth);
+  for (const p of pnls) {
+    let b = Math.floor((p - min) / binWidth);
+    if (b >= numBins) b = numBins - 1;
+    bins[b]++;
+  }
+
+  const maxBin = Math.max(...bins);
+  const pad = {t:16, b:24, l:36, r:16};
+  const cW = W-pad.l-pad.r, cH = H-pad.t-pad.b;
+  const barW = cW / numBins - 2;
+
+  for (let i = 0; i < numBins; i++) {
+    const x = pad.l + (i / numBins) * cW + 1;
+    const h = (bins[i] / maxBin) * cH;
+    const midVal = (binEdges[i] + binEdges[i+1]) / 2;
+    ctx.fillStyle = midVal >= 0 ? 'rgba(0,230,118,.5)' : 'rgba(255,82,82,.5)';
+    ctx.fillRect(x, pad.t + cH - h, barW, h);
+    ctx.strokeStyle = midVal >= 0 ? 'rgba(0,230,118,.8)' : 'rgba(255,82,82,.8)';
+    ctx.lineWidth = 1; ctx.strokeRect(x, pad.t + cH - h, barW, h);
+  }
+
+  // Zero line
+  if (min < 0 && max > 0) {
+    const zeroX = pad.l + ((0 - min) / range) * cW;
+    ctx.strokeStyle = 'rgba(74,90,122,.6)'; ctx.setLineDash([4,3]); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(zeroX, pad.t); ctx.lineTo(zeroX, H-pad.b); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  ctx.fillStyle = '#4a5a7a'; ctx.font = '9px JetBrains Mono, monospace'; ctx.textAlign = 'center';
+  ctx.fillText(fmt$(min, 3), pad.l, H-4);
+  ctx.fillText(fmt$(max, 3), W-pad.r, H-4);
+  if (min < 0 && max > 0) ctx.fillText('$0', pad.l + ((0-min)/range)*cW, H-4);
+}
+
+/* ── Trade Table ──────────────────────────────── */
+function renderTable() {
+  let filtered = [...allTrades];
+
+  // Filter
+  if (activeFilter === 'wins') filtered = filtered.filter(t => t.status === 'resolved' && t.won);
+  else if (activeFilter === 'losses') filtered = filtered.filter(t => t.status === 'resolved' && !t.won);
+  else if (activeFilter === 'up') filtered = filtered.filter(t => t.direction === 'up');
+  else if (activeFilter === 'down') filtered = filtered.filter(t => t.direction === 'down');
+  else if (activeFilter === 'pending') filtered = filtered.filter(t => t.status === 'pending');
+
+  // Sort
+  filtered.sort((a, b) => {
+    let va = a[sortCol], vb = b[sortCol];
+    if (typeof va === 'string') { va = va.toLowerCase(); vb = (vb||'').toLowerCase(); }
+    if (va < vb) return sortAsc ? -1 : 1;
+    if (va > vb) return sortAsc ? 1 : -1;
+    return 0;
+  });
+
+  const tbody = $('trade-tbody');
+  tbody.innerHTML = '';
+
+  for (const t of filtered) {
+    const tr = document.createElement('tr');
+    const resultClass = t.status === 'pending' ? 'td-pending' : (t.won ? 'td-win' : 'td-loss');
+    const dirPill = t.direction === 'up' ? '<span class="pill pill-up">UP</span>' : '<span class="pill pill-down">DN</span>';
+    const resultPill = t.status === 'pending'
+      ? '<span class="pill pill-pending">PENDING</span>'
+      : (t.won ? '<span class="pill pill-win">WIN</span>' : '<span class="pill pill-loss">LOSS</span>');
+
+    tr.innerHTML = `
+      <td>${fmtTime(t.timestamp)}</td>
+      <td>${dirPill}</td>
+      <td>${t.price.toFixed(3)}</td>
+      <td>${t.size.toFixed(1)}</td>
+      <td>${(t.edge * 100).toFixed(1)}%</td>
+      <td>${(t.confidence * 100).toFixed(1)}%</td>
+      <td>$${t.btc_price.toLocaleString()}</td>
+      <td class="${resultClass}">${fmt$(t.pnl, 4)}</td>
+      <td>${resultPill}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+/* ── Empty chart placeholder ──────────────────── */
+function drawEmpty(ctx, W, H, msg) {
+  ctx.fillStyle = '#4a5a7a'; ctx.font = '12px Inter, sans-serif';
+  ctx.textAlign = 'center'; ctx.fillText(msg || 'Waiting for trades...', W/2, H/2);
+}
+
+/* ── Filter buttons ───────────────────────────── */
+document.querySelectorAll('.filter-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    activeFilter = btn.dataset.filter;
+    renderTable();
+  });
+});
+
+/* ── Sort headers ─────────────────────────────── */
+document.querySelectorAll('th[data-col]').forEach(th => {
+  th.addEventListener('click', () => {
+    const col = th.dataset.col;
+    if (sortCol === col) sortAsc = !sortAsc;
+    else { sortCol = col; sortAsc = false; }
+    document.querySelectorAll('th').forEach(h => h.classList.remove('sorted'));
+    th.classList.add('sorted');
+    th.querySelector('.sort-arrow').textContent = sortAsc ? '▲' : '▼';
+    renderTable();
+  });
+});
+
+/* ── Resize handler ───────────────────────────── */
+let resizeTimer;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => fetchData(), 250);
+});
+
+/* ── Auto-refresh ─────────────────────────────── */
+fetchData();
+setInterval(fetchData, 10000); // refresh every 10s
+</script>
+</body>
+</html>
